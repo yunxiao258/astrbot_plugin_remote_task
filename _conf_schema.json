@@ -1,0 +1,87 @@
+{
+  "enabled": {
+    "description": "是否启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "serve_url": {
+    "description": "opencode serve 服务地址（插件托管或外部已有，如 http://127.0.0.1:4096）",
+    "type": "string",
+    "default": "http://127.0.0.1:4096"
+  },
+  "serve_port": {
+    "description": "插件托管 serve 时的监听端口",
+    "type": "int",
+    "default": 4096
+  },
+  "serve_username": {
+    "description": "opencode serve HTTP Basic Auth 用户名（可选，默认 opencode）",
+    "type": "string",
+    "default": ""
+  },
+  "serve_password": {
+    "description": "opencode serve HTTP Basic Auth 密码（可选，支持 env:/file:/dpapi:/base64: 前缀）",
+    "type": "string",
+    "default": ""
+  },
+  "serve_host": {
+    "description": "插件托管 serve 时的监听主机（本机用 127.0.0.1）",
+    "type": "string",
+    "default": "127.0.0.1"
+  },
+  "serve_listen": {
+    "description": "是否订阅 serve 全局事件（进度推送/完成检测需要，默认开启）",
+    "type": "bool",
+    "default": true
+  },
+  "opencode_exe": {
+    "description": "opencode 可执行文件路径（为空时自动从 PATH 查找）",
+    "type": "string",
+    "default": ""
+  },
+  "run_work_dir": {
+    "description": "本地 run 模式的任务执行工作目录（必填，不存在时拒绝下发任务）",
+    "type": "string",
+    "default": ""
+  },
+  "run_auto_approve": {
+    "description": "本地 run 模式是否自动批准未显式拒绝的权限（严格模式建议保持 false）",
+    "type": "bool",
+    "default": false
+  },
+  "run_no_output_timeout_seconds": {
+    "description": "本地 run 模式进程无新输出超时（秒），超时视为卡住并终止，最小 30",
+    "type": "int",
+    "default": 120
+  },
+  "serve_idle_complete_seconds": {
+    "description": "serve 模式：会话超过此秒数无事件视为执行完毕，最小 30",
+    "type": "int",
+    "default": 60
+  },
+  "admin_umos": {
+    "description": "管理员会话 UMO 白名单（如 default:GroupMessage:1102410958），多个用英文逗号分隔；必须配置，否则管理命令全部拒绝",
+    "type": "string",
+    "default": ""
+  },
+  "result_max_chars": {
+    "description": "任务结果推送的最大字符数（超出截断）",
+    "type": "int",
+    "default": 500
+  },
+  "max_tasks": {
+    "description": "tasks.json 中保留的最大任务条数，超出丢弃最旧",
+    "type": "int",
+    "default": 50
+  },
+  "progress_push": {
+    "description": "是否推送任务进度关键节点（开始/工具调用/完成）",
+    "type": "bool",
+    "default": true
+  },
+  "broadcast_umo": {
+    "description": "任务进度/结果播报目标会话 UMO，多个用英文逗号分隔；留空则播报给下发任务的会话",
+    "type": "string",
+    "default": ""
+  }
+}

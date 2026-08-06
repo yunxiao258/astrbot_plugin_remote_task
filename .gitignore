@@ -1,0 +1,18 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 本地数据与配置（敏感，不上传）
+data/
+*.log
+.env
+
+# 测试与临时输出
+.pytest_cache/
+out.txt
+*.pycache/
+
+# 编辑器
+.vscode/
+.idea/
