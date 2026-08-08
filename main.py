@@ -13,6 +13,7 @@
 
 import asyncio
 import ctypes
+import json
 import os
 import time
 import traceback
@@ -25,7 +26,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 from .client import ServeClient, ServeManager
-from .runner import RunProcess
+from .runner import RunProcess, permission_rules_to_env
 from .tracker import (
     ProgressHub,
     Task,
@@ -41,7 +42,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.0.0",
+    "1.1.0",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -64,6 +65,7 @@ class RemoteTaskPlugin(Star):
         self._serve_done: set[str] = set()
         self._serve_activity: dict[str, float] = {}  # 会话最后活动时间
         self._dedup: dict[str, float] = {}  # 跨平台同消息（message_id）去重
+        self._task_permissions: dict[str, dict] = {}  # 任务 ID → 挂起权限请求信息
         # serve
         serve_url = config.get("serve_url", "") or ""
         serve_user = self._resolve_cred(config.get("serve_username", "") or "")
@@ -213,6 +215,43 @@ class RemoteTaskPlugin(Star):
             text = await self._cancel(tokens[0])
         await self._safe_send(event, text)
 
+    @filter.command("任务同意", alias={"任务放行"})
+    async def task_approve_cmd(self, event: AstrMessageEvent):
+        """紧凑形式：/任务同意 <id> [always]（放行挂起的权限请求）"""
+        if not self.cfg.get("enabled", True):
+            return
+        if self._is_self_message(event):
+            return
+        if self._is_repeat_message(event):
+            return
+        tokens = self._strip_self_cmd(event.message_str, "任务同意").split()
+        if not tokens:
+            text = "用法: /任务同意 <id> [always]"
+        elif not self._is_admin(event):
+            text = self._deny()
+        else:
+            remember = len(tokens) > 1 and tokens[1].lower() in ("always", "记住")
+            text = await self._respond_permission(tokens[0], True, remember)
+        await self._safe_send(event, text)
+
+    @filter.command("任务拒绝")
+    async def task_reject_cmd(self, event: AstrMessageEvent):
+        """紧凑形式：/任务拒绝 <id>（拒绝挂起的权限请求）"""
+        if not self.cfg.get("enabled", True):
+            return
+        if self._is_self_message(event):
+            return
+        if self._is_repeat_message(event):
+            return
+        tokens = self._strip_self_cmd(event.message_str, "任务拒绝").split()
+        if not tokens:
+            text = "用法: /任务拒绝 <id>"
+        elif not self._is_admin(event):
+            text = self._deny()
+        else:
+            text = await self._respond_permission(tokens[0], False)
+        await self._safe_send(event, text)
+
     @filter.command("任务下发", alias={"任务执行", "任务跑"})
     async def task_submit_cmd(self, event: AstrMessageEvent):
         """紧凑形式：/任务下发 <描述>"""
@@ -286,6 +325,19 @@ class RemoteTaskPlugin(Star):
             if len(tokens) < 2:
                 return "用法: /任务 取消 <id>"
             return await self._cancel(tokens[1])
+        if cmd == "同意":
+            if not is_admin:
+                return self._deny()
+            if len(tokens) < 2:
+                return "用法: /任务 同意 <id> [always]"
+            remember = len(tokens) > 2 and tokens[2].lower() in ("always", "记住")
+            return await self._respond_permission(tokens[1], True, remember)
+        if cmd == "拒绝":
+            if not is_admin:
+                return self._deny()
+            if len(tokens) < 2:
+                return "用法: /任务 拒绝 <id>"
+            return await self._respond_permission(tokens[1], False)
         if cmd in ("下发", "执行", "跑"):
             if not is_admin:
                 return self._deny()
@@ -303,6 +355,7 @@ class RemoteTaskPlugin(Star):
             "任务命令可用:\n"
             "/任务 <描述> 下发任务（自动选执行模式）\n"
             "/任务列表 /任务详情 <id> /任务取消 <id>\n"
+            "/任务 同意 <id> [always] 放行挂起权限 / /任务 拒绝 <id> 拒绝\n"
             "/任务模式 /任务 serve 状态|启动|停止"
         )
 
@@ -491,6 +544,20 @@ class RemoteTaskPlugin(Star):
         rel = os.path.expandvars(os.path.expanduser(rel))
         return rel
 
+    def _run_permission_extra(self) -> dict:
+        """从 run_permission_allow 配置（JSON）构造 run 进程环境注入"""
+        raw = self.cfg.get("run_permission_allow", "") or ""
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            rules = json.loads(raw)
+        except ValueError as e:
+            logger.warning(f"run_permission_allow 不是合法 JSON，已忽略: {e}")
+            return {}
+        if not isinstance(rules, dict) or not rules:
+            return {}
+        return permission_rules_to_env(rules)
+
     # ---------- 任务执行 ----------
 
     async def _submit(self, desc: str, creator_umo: str, creator_self_id: str = "") -> str:
@@ -545,6 +612,8 @@ class RemoteTaskPlugin(Star):
     async def _execute_run(self, task: Task):
         if self._get_status(task.id) == "aborted":
             return
+        # run 模式无 TTY：resolve 为 ask 的权限会挂起进程，按配置把规则注入内联配置放行
+        env_extra = self._run_permission_extra()
         runner = RunProcess(
             task_id=task.id,
             desc=task.desc,
@@ -553,6 +622,7 @@ class RemoteTaskPlugin(Star):
             auto_approve=bool(self.cfg.get("run_auto_approve", False)),
             on_event=self._on_run_event,
             opencode_exe=self.cfg.get("opencode_exe", "") or None,
+            env_extra=env_extra,
         )
         self._runners[task.id] = runner
         ok = await runner.start()
@@ -587,8 +657,9 @@ class RemoteTaskPlugin(Star):
             self.store.update(task_id, summary=text[:2000])
         elif kind == "permission":
             await self._broadcast(
-                f"任务 #{task_id} 等待权限批准（工具: {text}）\n"
-                "可用 status_sync 插件的群审批放行，或等待超时中止",
+                f"任务 #{task_id} 请求权限（{text}）\n"
+                "本地 run 模式无法动态审批：请在插件配置 run_permission_allow "
+                "中放行该权限后重跑，或开启 run_auto_approve 全部放行",
                 self._creator_of(task_id),
                 self._creator_self_of(task_id),
             )
@@ -653,6 +724,7 @@ class RemoteTaskPlugin(Star):
         self._task_by_session.pop(sid, None)
         self._serve_activity.pop(sid, None)
         self._serve_done.discard(sid)
+        self._task_permissions.pop(task.id, None)
         if self._get_status(task.id) == "aborted":
             return
         text = await asyncio.to_thread(
@@ -674,7 +746,7 @@ class RemoteTaskPlugin(Star):
                 f"任务 #{task.id} 超时未完成（无完成事件，已视为失败）", task.creator_umo, task.creator_self_id
             )
 
-    async def _on_serve_event(self, kind: str, session_id: str, text: str):
+    async def _on_serve_event(self, kind: str, session_id: str, text: str, meta=None):
         """serve 全局事件 → 只处理本插件任务会话"""
         task_id = self._task_by_session.get(session_id)
         if not task_id:
@@ -688,12 +760,52 @@ class RemoteTaskPlugin(Star):
         if kind == "text":
             self.store.update(task_id, summary=text[:2000])
         elif kind == "permission":
+            meta = meta if isinstance(meta, dict) else {}
+            self._task_permissions[task_id] = {
+                "session_id": session_id,
+                "permission_id": meta.get("permission_id", ""),
+                "detail": text,
+            }
             await self._broadcast(
-                f"任务 #{task_id} 等待权限批准（{text}）\n可用 status_sync 插件的群审批放行",
+                f"任务 #{task_id} 等待权限批准（{text}）\n"
+                f"管理员可用: /任务 同意 {task_id} 放行，或 /任务 拒绝 {task_id}",
                 self._creator_of(task_id),
                 self._creator_self_of(task_id),
             )
         self.hub.emit(task_id, kind, text)
+
+    # ---------- 权限审批 ----------
+
+    async def _respond_permission(
+        self, task_id: str, approve: bool, remember: bool = False
+    ) -> str:
+        """管理员审批（同意/拒绝）任务挂起的权限请求"""
+        t = self.store.get(task_id)
+        if not t:
+            return f"任务不存在: {task_id}"
+        if t.status != "running":
+            return f"任务 #{task_id} 未在运行（{status_label(t.status)}），无需审批"
+        info = self._task_permissions.get(task_id)
+        perm_id = (info or {}).get("permission_id") if isinstance(info, dict) else ""
+        session_id = (info or {}).get("session_id") or t.session_id
+        if not perm_id:
+            return f"任务 #{task_id} 当前没有请求审批的权限（插件重启后挂起请求会失效）"
+        if not self.serve_client:
+            return "serve 客户端未配置（serve_url 为空），无法审批"
+        response = "always" if (approve and remember) else ("once" if approve else "reject")
+        ok = await asyncio.to_thread(
+            self.serve_client.respond_permission, session_id, perm_id, response
+        )
+        if not ok:
+            return f"任务 #{task_id} 权限{'同意' if approve else '拒绝'}失败（serve 未响应，请求可能已失效）"
+        self._task_permissions.pop(task_id, None)
+        verb = "已同意" if approve else "已拒绝"
+        await self._broadcast(
+            f"任务 #{task_id} 权限{verb}（管理员操作）",
+            self._creator_of(task_id),
+            self._creator_self_of(task_id),
+        )
+        return f"任务 #{task_id} 权限{verb}"
 
     # ---------- 取消 ----------
 
@@ -707,6 +819,7 @@ class RemoteTaskPlugin(Star):
             ok = await asyncio.to_thread(self.serve_client.abort, t.session_id)
             self._task_by_session.pop(t.session_id, None)
             self._serve_done.discard(t.session_id)
+            self._task_permissions.pop(task_id, None)
             if not ok:
                 return "取消请求已发送（serve 可能未响应 abort）"
         elif t.mode == "run" and t.pid:

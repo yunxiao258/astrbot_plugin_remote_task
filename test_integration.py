@@ -40,6 +40,18 @@ class FakeCfg:
         return self.kw.get(key, default)
 
 
+class FakeServeClient:
+    """记录 respond_permission 调用的 serve 客户端替身"""
+
+    def __init__(self):
+        self.calls = []
+        self.fail = False
+
+    def respond_permission(self, session_id, permission_id, response):
+        self.calls.append((session_id, permission_id, response))
+        return not self.fail
+
+
 class FakeContext:
     def __init__(self):
         self.sent = []
@@ -104,6 +116,7 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
     plugin._runners = {}
     plugin._task_by_session = {}
     plugin._serve_done = set()
+    plugin._task_permissions = {}
     plugin.serve_client = None
     plugin.serve_manager = ServeManager(os.path.join(tmp_path, "serve.json"))
     plugin.context = FakeContext()
@@ -225,6 +238,51 @@ def test_mode_report_reason(tmp_path):
     run(go())
 
 
+def test_approve_permission(tmp_path):
+    print("[权限审批命令]")
+    p = make_plugin(tmp_path)
+    fake = FakeServeClient()
+    p.serve_client = fake
+    p.store.add(Task(id="perm1", desc="审批任务", creator_umo=ADMIN_UMO, mode="serve",
+                     status="running", session_id="sess-1"))
+    p._task_permissions["perm1"] = {"session_id": "sess-1", "permission_id": "per_1", "detail": "x"}
+
+    async def go():
+        r1 = await p._handle(FakeEvent("同意 perm1"))
+        check("同意放行成功", "已同意" in r1)
+        check("once 语义", fake.calls[-1] == ("sess-1", "per_1", "once"))
+        check("审批后清除挂起记录", "perm1" not in p._task_permissions)
+
+        p._task_permissions["perm1"] = {"session_id": "sess-1", "permission_id": "per_2", "detail": "x"}
+        r2 = await p._handle(FakeEvent("同意 perm1 always"))
+        check("always 语义", fake.calls[-1][2] == "always" and "已同意" in r2)
+
+        p._task_permissions["perm1"] = {"session_id": "sess-1", "permission_id": "per_3", "detail": "x"}
+        r3 = await p._handle(FakeEvent("拒绝 perm1"))
+        check("拒绝语义", fake.calls[-1][2] == "reject" and "已拒绝" in r3)
+
+        r4 = await p._handle(FakeEvent("同意 perm1"))
+        check("无挂起请求提示", "没有请求审批" in r4)
+
+        r5 = await p._handle(FakeEvent("同意 nope"))
+        check("任务不存在", "不存在" in r5)
+
+        p.store.update("perm1", status="done")
+        r6 = await p._handle(FakeEvent("同意 perm1"))
+        check("已结束任务提示", "未在运行" in r6)
+
+        p.store.update("perm1", status="running")
+        p._task_permissions["perm1"] = {"session_id": "sess-1", "permission_id": "per_4", "detail": "x"}
+        fake.fail = True
+        r7 = await p._handle(FakeEvent("同意 perm1"))
+        check("审批失败提示", "失败" in r7)
+        fake.fail = False
+
+        r8 = await p._handle(FakeEvent("同意 perm1", session="default:GroupMessage:111"))
+        check("非管理员拒绝审批", "没有执行此命令的权限" in r8)
+    run(go())
+
+
 def run_all(tmp_path):
     test_admin_gate(tmp_path)
     test_query_commands(tmp_path)
@@ -232,6 +290,7 @@ def run_all(tmp_path):
     test_submit_workdir_missing(tmp_path)
     test_submit_and_fail_chain(tmp_path)
     test_cancel_unknown(tmp_path)
+    test_approve_permission(tmp_path)
     test_utils(tmp_path)
     test_mode_report_reason(tmp_path)
 

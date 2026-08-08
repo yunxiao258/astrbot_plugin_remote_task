@@ -38,6 +38,22 @@ def build_run_command(
     return cmd
 
 
+def permission_rules_to_env(rules: dict | None) -> dict:
+    """把 permission 规则注入 run 进程环境（OPENCODE_CONFIG_CONTENT 内联配置）。
+
+    headless `opencode run` 遇到解析为 ask 的权限会永久挂起（无 TTY 无法审批），
+    通过内联配置把需要放行的权限类改为 allow，从源头避免挂起。
+    无效输入返回空 dict（不注入，保持既有行为）。
+    """
+    if not rules or not isinstance(rules, dict):
+        return {}
+    return {
+        "OPENCODE_CONFIG_CONTENT": json.dumps(
+            {"permission": rules}, ensure_ascii=False
+        )
+    }
+
+
 # ---------------- 事件解析 ----------------
 
 def _extract_text(payload, depth: int = 0) -> str:

@@ -17,6 +17,7 @@ from astrbot_plugin_remote_task.runner import (
     _extract_text,
     build_run_command,
     parse_run_event,
+    permission_rules_to_env,
 )
 
 PASS = 0
@@ -53,6 +54,18 @@ def test_extract_text():
     check("列表内容", _extract_text([{"content": "a"}, {"content": "b"}]) == "a\nb")
     check("空 dict 为空", _extract_text({}) == "")
     check("循环引用安全", _extract_text({"a": {"b": {"c": {"d": {"e": {"f": {"g": {}}}}}}}}) == "")
+
+
+def test_permission_rules_to_env():
+    print("[权限规则注入]")
+    env = permission_rules_to_env({"external_directory": "allow"})
+    check("合法规则生成环境变量", "OPENCODE_CONFIG_CONTENT" in env)
+    import json
+    cfg = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    check("变量内容是 permission 配置", cfg == {"permission": {"external_directory": "allow"}})
+    check("空规则不注入", permission_rules_to_env(None) == {})
+    check("空 dict 不注入", permission_rules_to_env({}) == {})
+    check("非 dict 不注入", permission_rules_to_env("x") == {})
 
 
 def test_parse_run_event():
@@ -142,6 +155,7 @@ def test_run_start_failure(tmp_path):
 def run_all(tmp_path):
     test_build_run_command()
     test_extract_text()
+    test_permission_rules_to_env()
     test_parse_run_event()
     test_run_done(tmp_path)
     test_run_failure_exit(tmp_path)

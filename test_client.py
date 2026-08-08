@@ -41,6 +41,8 @@ class FakeHandler(BaseHTTPRequestHandler):
     sessions = {}
     prompts = []
     aborts = []
+    permission_responses = []
+    permission_bodies = []
     last_body = ""
 
     def log_message(self, *a):
@@ -75,6 +77,10 @@ class FakeHandler(BaseHTTPRequestHandler):
         elif self.path.endswith("/abort"):
             self.aborts.append(1)
             self._send_json(200, {"ok": True})
+        elif "/permissions/" in self.path:
+            self.permission_responses.append(self.path)
+            self.permission_bodies.append(self.last_body)
+            self._send_json(200, True)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -92,6 +98,7 @@ def test_parse_sse_payload():
                            json.dumps({"type": "message.updated", "sessionID": "s1",
                                        "message": {"text": "你好"}}))
     check("message→(text,sid,内容)", ev is not None and ev[0] == "text" and ev[1] == "s1" and ev[2] == "你好")
+    check("message→meta 空 dict", ev is not None and isinstance(ev[3], dict) and not ev[3])
     ev = parse_sse_payload("tool",
                            json.dumps({"type": "tool", "sessionID": "s2",
                                        "toolName": "edit", "toolInput": {"file_path": "a.py"}}))
@@ -99,7 +106,49 @@ def test_parse_sse_payload():
     ev = parse_sse_payload("permission.request",
                            json.dumps({"type": "permission.request", "sessionID": "s3",
                                        "permission": {"pattern": "bash *"}}))
-    check("permission 事件", ev is not None and ev[0] == "permission" and "bash" in ev[2])
+    check("permission 事件（旧格式）", ev is not None and ev[0] == "permission" and "bash" in ev[2])
+    # opencode 1.18 真实格式：permission.asked + properties
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "permission.asked", "sessionID": "s5",
+                                       "properties": {"id": "per_123", "permission": "external_directory",
+                                                      "patterns": ["C:\\\\Windows\\\\*"],
+                                                      "always": ["C:\\\\Windows\\\\*"],
+                                                      "metadata": {"filepath": "C:\\\\Windows\\\\win.ini"}}}))
+    check("permission.asked→permission", ev is not None and ev[0] == "permission")
+    check("permission.asked 提取 ID", ev is not None and ev[3].get("permission_id") == "per_123")
+    check("permission.asked 提取路径", ev is not None and "win.ini" in ev[2])
+    check("permission.asked 提取 always", ev is not None and ev[3].get("always") == ["C:\\\\Windows\\\\*"])
+    # message.part.updated 的 tool part（真实格式）
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "message.part.updated", "sessionID": "s6",
+                                       "properties": {"part": {"type": "tool", "tool": "bash",
+                                                               "state": {"input": {"command": "git push"}}}}}))
+    check("part.updated tool→tool", ev is not None and ev[0] == "tool" and "git push" in ev[2])
+    # message.part.updated 的 text part
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "message.part.updated", "sessionID": "s7",
+                                       "properties": {"part": {"type": "text", "text": "部分输出"}}}))
+    check("part.updated text→text", ev is not None and ev[0] == "text" and ev[2] == "部分输出")
+    # sync 包装解包
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "sync",
+                                       "syncEvent": {"type": "message.part.updated.1", "seq": 1,
+                                                     "data": {"type": "message.part.updated", "sessionID": "s8",
+                                                              "properties": {"part": {"type": "tool", "tool": "edit",
+                                                                                      "state": {"input": {"file_path": "b.js"}}}}}}}))
+    check("sync 包装内 tool 事件", ev is not None and ev[0] == "tool" and "b.js" in ev[2])
+    # message.updated（sessionID 在 properties 内层的真实格式）
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "message.part.updated",
+                                       "properties": {"sessionID": "s9",
+                                                      "part": {"type": "text", "text": "内层会话"}}}))
+    check("properties.sessionID 提取", ev is not None and ev[1] == "s9" and ev[2] == "内层会话")
+    # message.part.delta（真实流式事件）
+    ev = parse_sse_payload("",
+                           json.dumps({"type": "message.part.delta",
+                                       "properties": {"sessionID": "s10", "messageID": "m1",
+                                                      "partID": "p1", "field": "text", "delta": ""}}))
+    check("part.delta 忽略（无文本）", ev is None)
     ev = parse_sse_payload("session.updated",
                            json.dumps({"type": "finished", "sessionID": "s4"}))
     check("finished→done", ev is not None and ev[0] == "done")
@@ -122,10 +171,20 @@ def test_serve_api():
         check("abort 成功", c.abort(sid) is True)
         check("abort 被调用", len(FakeHandler.aborts) == 1)
 
+        FakeHandler.permission_responses.clear()
+        FakeHandler.permission_bodies.clear()
+        ok = c.respond_permission(sid, "per_1", "always")
+        check("审批接口成功", ok is True)
+        check("审批路径含 permission ID", len(FakeHandler.permission_responses) == 1
+              and "per_1" in FakeHandler.permission_responses[0])
+        body = json.loads(FakeHandler.permission_bodies[-1])
+        check("审批 body response", body.get("response") == "always")
+
         c2 = ServeClient("http://127.0.0.1:1")
         check("不可达 probe False", c2.probe() is False)
         check("不可达 create_session None", c2.create_session() is None)
         check("不可达 send_prompt False", c2.send_prompt("x", "y") is False)
+        check("不可达 respond_permission False", c2.respond_permission("x", "p", "once") is False)
         check("不可达 get_message_text 空", c2.get_message_text("x") == "")
     finally:
         srv.shutdown()

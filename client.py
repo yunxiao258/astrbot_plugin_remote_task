@@ -29,10 +29,11 @@ from .runner import _extract_text
 
 # ---------------- SSE 解析 ----------------
 
-def parse_sse_payload(event: str, data: str) -> tuple[str, str, str] | None:
-    """解析一条 SSE 事件为 (kind, session_id, text)；非任务事件返回 None。
+def parse_sse_payload(event: str, data: str) -> tuple[str, str, str, dict] | None:
+    """解析一条 SSE 事件为 (kind, session_id, text, meta)；非任务事件返回 None。
 
     kind: text / tool / permission / done
+    meta: 附加结构化信息（permission 事件含 permission_id 等），无附加信息为空 dict
     """
     try:
         payload = json.loads(data)
@@ -40,23 +41,65 @@ def parse_sse_payload(event: str, data: str) -> tuple[str, str, str] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    # opencode serve 的 SSE data 为 {"payload": {...}} 包裹
+    # "payload": {...} 包裹解包
     if "payload" in payload and isinstance(payload["payload"], dict):
         payload = payload["payload"]
     if not isinstance(payload, dict):
         return None
     ev_name = str(event or "")
     pl_type = str(payload.get("type") or "")
+    # "sync" 包装：把内部 syncEvent.data 作为主载荷（type 带 ".1" 序号）
+    if pl_type == "sync" and isinstance(payload.get("syncEvent"), dict):
+        inner = payload["syncEvent"]
+        inner_data = inner.get("data")
+        if isinstance(inner_data, dict):
+            payload = inner_data
+            pl_type = str(inner_data.get("type") or payload.get("type") or "")
     etype = ev_name or pl_type
     full = ev_name + " " + pl_type
-    session_id = payload.get("sessionID") or payload.get("session_id") or payload.get("sessionId")
+    # 真实事件里 sessionID 位于 properties 内（顶层一般没有）
+    props = payload.get("properties")
+    if not isinstance(props, dict):
+        props = None
+    session_id = (
+        payload.get("sessionID")
+        or payload.get("session_id")
+        or payload.get("sessionId")
+        or (props.get("sessionID") if props else None)
+        or (props.get("session_id") if props else None)
+        or (props.get("sessionId") if props else None)
+    )
     if not session_id:
         return None
     sid = str(session_id)
+    # message.part.updated：part 内声明类型（tool / text）优先分发
+    if full.endswith("message.part.updated") or "message.part.updated" in full:
+        props = payload.get("properties")
+        part = props.get("part") if isinstance(props, dict) else None
+        if isinstance(part, dict):
+            ptype = str(part.get("type") or "")
+            if ptype == "tool":
+                tool = part.get("tool") or "工具"
+                state = part.get("state") or {}
+                inp = state.get("input") or {}
+                if isinstance(inp, dict):
+                    arg_text = " ".join(
+                        f"{k}={v}" for k, v in inp.items()
+                        if k in ("command", "file_path", "path", "pattern", "query")
+                    )
+                else:
+                    arg_text = str(inp)[:120]
+                return ("tool", sid, f"{tool} {arg_text}".strip(), {})
+            if ptype == "text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    return ("text", sid, text, {})
+            if ptype == "reasoning":
+                return None
     if "message.updated" in full:
         text = _extract_text(payload)
         if text:
-            return ("text", sid, text)
+            return ("text", sid, text, {})
         return None
     if "tool" in full:
         tool = payload.get("toolName") or payload.get("name") or payload.get("tool") or "工具"
@@ -68,15 +111,33 @@ def parse_sse_payload(event: str, data: str) -> tuple[str, str, str] | None:
             )
         else:
             arg_text = str(args)[:120]
-        return ("tool", sid, f"{tool} {arg_text}".strip())
+        return ("tool", sid, f"{tool} {arg_text}".strip(), {})
     if "permission" in full:
-        detail = _extract_text(payload) or payload.get("permission") or ""
-        if isinstance(detail, dict):
-            detail = detail.get("pattern", "") or detail.get("description", "")
-        return ("permission", sid, f"请求权限: {detail}" if detail else "请求权限")
+        meta: dict = {}
+        detail = _extract_text(payload) or ""
+        props = payload.get("properties")
+        if isinstance(props, dict):
+            meta = {
+                "permission_id": str(props.get("id") or ""),
+                "permission": str(props.get("permission") or ""),
+                "patterns": list(props.get("patterns") or []),
+                "always": list(props.get("always") or []),
+            }
+            md = props.get("metadata")
+            if isinstance(md, dict):
+                meta["filepath"] = str(md.get("filepath") or "")
+            if not detail:
+                detail = " ".join(
+                    filter(None, (meta.get("permission"), meta.get("filepath")))
+                )
+        else:
+            old = payload.get("permission")
+            if isinstance(old, dict):
+                detail = old.get("pattern", "") or old.get("description", "")
+        return ("permission", sid, f"请求权限: {detail}" if detail else "请求权限", meta)
     if "finished" in full or "complete" in full:
         text = _extract_text(payload)
-        return ("done", sid, text)
+        return ("done", sid, text, {})
     return None
 
 
@@ -251,6 +312,30 @@ class ServeClient:
             logger.warning(f"中止会话异常: {e}")
             return False
 
+    def respond_permission(
+        self, session_id: str, permission_id: str, response: str = "once"
+    ) -> bool:
+        """响应挂起的权限请求（serve 审批 API）。
+
+        response: once=仅本次同意 / always=会话内按模式记住并同意 / reject=拒绝
+        """
+        try:
+            r = self._post(
+                f"{self.base_url}/session/{session_id}/permissions/{permission_id}",
+                json={"response": response},
+                timeout=10,
+                headers=self._headers(),
+            )
+            if not (200 <= r.status_code < 300):
+                logger.warning(
+                    f"权限审批 HTTP {r.status_code}（permission={permission_id}）"
+                )
+                return False
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"权限审批异常: {e}")
+            return False
+
     async def listen_loop(self, on_event: Callable[[str, str, str], Coroutine], loop=None):
         """SSE 事件监听循环（断线自动重连）"""
         while True:
@@ -283,13 +368,13 @@ class ServeClient:
                 if event and data_lines:
                     ev = parse_sse_payload(event, "\n".join(data_lines))
                     if ev:
-                        kind, sid, text = ev
+                        kind, sid, text, meta = ev
                         if loop is not None:
                             asyncio.run_coroutine_threadsafe(
-                                on_event(kind, sid, text), loop
+                                on_event(kind, sid, text, meta), loop
                             )
                         else:
-                            asyncio.run(on_event(kind, sid, text))
+                            asyncio.run(on_event(kind, sid, text, meta))
                 event = ""
                 data_lines = []
 
