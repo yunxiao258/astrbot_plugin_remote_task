@@ -56,6 +56,7 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 | `result_max_chars` | 结果推送最大字符数（默认 500） |
 | `max_tasks` | 历史任务保留条数（默认 50） |
 | `progress_push` | 是否推送进度关键节点 |
+| `notify_mention_creator` | 任务完成/失败播报时 @ 下发者（onebot 群聊生效，默认开） |
 | `broadcast_umo` | 结果播报目标会话（留空播给下发会话） |
 
 ## 权限联动

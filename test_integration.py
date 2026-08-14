@@ -63,10 +63,14 @@ class FakeContext:
 
 
 class FakeEvent:
-    def __init__(self, message_str, session=ADMIN_UMO):
+    def __init__(self, message_str, session=ADMIN_UMO, sender_id=""):
         self.message_str = message_str
         self._session = session
+        self._sender_id = sender_id
         self.sent_text = None
+
+    def get_sender_id(self):
+        return self._sender_id
 
     @property
     def session(self):
@@ -87,7 +91,7 @@ class FakeEvent:
 _BROADCAST_LOG = []
 
 
-async def fake_broadcast(msg, umo, sid):
+async def fake_broadcast(msg, umo, sid, uid=""):
     _BROADCAST_LOG.append(msg)
 
 
@@ -144,6 +148,45 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def test_mention_creator_and_result_tail(tmp_path):
+    print("[完成播报 @下发者 与结果高亮]")
+    p = make_plugin(tmp_path)
+
+    # onebot 群聊：@ 下发者
+    chain = p._build_chain("任务完成", "onebot:GroupMessage:123", "10001")
+    from astrbot.api.message_components import At
+
+    first = chain.chain[0]
+    check("onebot 群播报 @ 下发者", isinstance(first, At) and first.qq == 10001)
+    check("文本仍随消息链", "任务完成" in "".join(c.text for c in chain.chain if hasattr(c, "text")))
+
+    # 私聊/非 onebot 不 @
+    chain2 = p._build_chain("x", "onebot:PrivateMessage:1", "10001")
+    check("私聊不 @", not any(isinstance(c, At) for c in chain2.chain))
+    chain3 = p._build_chain("x", "default:GroupMessage:1", "10001")
+    check("非 onebot 平台不 @", not any(isinstance(c, At) for c in chain3.chain))
+
+    # 关闭 @
+    p2 = make_plugin(tmp_path, cfg_extra={"notify_mention_creator": False})
+    chain4 = p2._build_chain("x", "onebot:GroupMessage:1", "10001")
+    check("关闭后不 @", not any(isinstance(c, At) for c in chain4.chain))
+
+    # 非数字下发者 ID 不 @
+    chain5 = p._build_chain("x", "onebot:GroupMessage:1", "not-a-number")
+    check("非法 ID 不 @", not any(isinstance(c, At) for c in chain5.chain))
+
+    # 结果高亮
+    check("无输出提示", "无文本输出" in p._result_tail(""))
+    check("正常结果无警告", "⚠️" not in p._result_tail("一切都好"))
+    check("错误关键词警告", "⚠️" in p._result_tail("执行遇到 error"))
+    check("失败关键词警告", "⚠️" in p._result_tail("任务失败"))
+
+    # creator_user_id 随任务持久化
+    t = Task(id="m1", desc="x", creator_umo="g:1", creator_user_id="10001")
+    t2 = Task.from_dict(t.to_dict())
+    check("creator_user_id 往返保留", t2.creator_user_id == "10001")
 
 
 def test_admin_gate(tmp_path):

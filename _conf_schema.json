@@ -79,6 +79,11 @@
     "type": "bool",
     "default": true
   },
+  "notify_mention_creator": {
+    "description": "任务完成/失败播报时 @ 下发者（仅 onebot 群聊生效）",
+    "type": "bool",
+    "default": true
+  },
   "broadcast_umo": {
     "description": "任务进度/结果播报目标会话 UMO，多个用英文逗号分隔；留空则播报给下发任务的会话",
     "type": "string",

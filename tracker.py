@@ -36,6 +36,7 @@ class Task:
     desc: str
     creator_umo: str
     creator_self_id: str = ""
+    creator_user_id: str = ""  # 下发者用户 ID（用于完成/失败时 @ 提醒）
     mode: str = ""  # serve / run
     status: str = "pending"
     created_at: str = field(default_factory=now_iso)
@@ -57,6 +58,7 @@ class Task:
             desc=d.get("desc", ""),
             creator_umo=d.get("creator_umo", ""),
             creator_self_id=d.get("creator_self_id", ""),
+            creator_user_id=d.get("creator_user_id", ""),
             mode=d.get("mode", ""),
             status=d.get("status", "pending"),
             created_at=d.get("created_at", ""),

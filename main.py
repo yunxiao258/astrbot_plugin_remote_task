@@ -283,7 +283,7 @@ class RemoteTaskPlugin(Star):
         elif not self._is_admin(event):
             text = self._deny()
         else:
-            text = await self._submit(desc, str(event.session), self._event_self_id(event))
+            text = await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
         await self._safe_send(event, text)
 
     @filter.command("任务serve")
@@ -356,7 +356,7 @@ class RemoteTaskPlugin(Star):
             desc = " ".join(tokens[1:])
             if not desc:
                 return "用法: /任务 下发 <任务描述>（或直接 /任务 <描述>）"
-            return await self._submit(desc, str(event.session), self._event_self_id(event))
+            return await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
         if cmd == "定时":
             if not is_admin:
                 return self._deny()
@@ -372,7 +372,7 @@ class RemoteTaskPlugin(Star):
         # 默认整条视为任务描述
         if not is_admin:
             return self._deny()
-        return await self._submit(" ".join(tokens), str(event.session), self._event_self_id(event))
+        return await self._submit(" ".join(tokens), str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
 
     def _usage(self) -> str:
         return (
@@ -548,12 +548,51 @@ class RemoteTaskPlugin(Star):
             logger.warning(f"self_id 直发失败（回退 send_message）: {e!r}")
         return await self.context.send_message(umo, chain)
 
-    async def _broadcast(self, text: str, creator_umo: str = "", creator_self_id: str = ""):
+    async def _broadcast(
+        self,
+        text: str,
+        creator_umo: str = "",
+        creator_self_id: str = "",
+        mention_user_id: str = "",
+    ):
         for umo in self._broadcast_targets(creator_umo):
             try:
-                await self._send_chain(umo, MessageChain([Plain(text)]), creator_self_id)
+                chain = self._build_chain(text, umo, mention_user_id)
+                await self._send_chain(umo, chain, creator_self_id)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"播报到 {umo} 失败: {e!r}\n{traceback.format_exc()}")
+
+    def _build_chain(self, text: str, umo: str, mention_user_id: str = ""):
+        """构建播报消息链；onebot 群内且配置开启时 @ 下发者"""
+        comps = []
+        if (
+            mention_user_id
+            and mention_user_id.isdigit()
+            and umo.startswith("onebot:")
+            and "GroupMessage" in umo
+            and self.cfg.get("notify_mention_creator", True)
+        ):
+            try:
+                from astrbot.api.message_components import At
+
+                comps.append(At(qq=int(mention_user_id)))
+            except Exception:  # noqa: BLE001
+                pass
+        comps.append(Plain(text))
+        return MessageChain(comps)
+
+    @staticmethod
+    def _result_tail(summary: str) -> str:
+        """完成播报的结果段：无输出时提示；结果疑似含错误时附 ⚠️ 高亮"""
+        s = (summary or "").strip()
+        if not s:
+            return "\n结果: （无文本输出）"
+        low = s.lower()
+        warn = any(
+            m in low
+            for m in ("error", "fail", "failed", "失败", "错误", "异常", "出错")
+        )
+        return f"\n结果: {RemoteTaskPlugin._clip(s)}" + ("\n⚠️ 结果可能包含错误，请查看详情" if warn else "")
 
     async def _on_progress(self, task_id: str, kind: str, text: str):
         """进度事件（限流后）广播到群"""
@@ -651,7 +690,9 @@ class RemoteTaskPlugin(Star):
 
     # ---------- 任务执行 ----------
 
-    async def _submit(self, desc: str, creator_umo: str, creator_self_id: str = "") -> str:
+    async def _submit(
+        self, desc: str, creator_umo: str, creator_self_id: str = "", creator_user_id: str = ""
+    ) -> str:
         mode, reason = self._decide_mode()
         if mode == "不可执行":
             return f"无法下发任务: {reason}"
@@ -661,6 +702,7 @@ class RemoteTaskPlugin(Star):
                 desc=desc,
                 creator_umo=creator_umo,
                 creator_self_id=creator_self_id,
+                creator_user_id=creator_user_id,
                 mode=mode,
             )
         )
@@ -760,7 +802,10 @@ class RemoteTaskPlugin(Star):
         ok = await runner.start()
         if not ok:
             self.store.update(task.id, status="failed", error=runner.error, finished_at=now_iso())
-            await self._broadcast(f"任务 #{task.id} 启动失败: {runner.error}", task.creator_umo, task.creator_self_id)
+            await self._broadcast(
+                f"任务 #{task.id} 启动失败: {runner.error}",
+                task.creator_umo, task.creator_self_id, task.creator_user_id,
+            )
             return
         self.store.update(task.id, status="running", pid=runner.pid)
         await self._broadcast(
@@ -771,16 +816,19 @@ class RemoteTaskPlugin(Star):
         summary = (t.summary if t else "") or (runner.error or "")
         if status == "done":
             self.store.update(task.id, status="done", summary=summary, finished_at=now_iso())
-            tail = f"\n结果: {self._clip(summary)}" if summary.strip() else "\n结果: （无文本输出）"
             await self._broadcast(
-                f"任务 #{task.id} 完成{tail}", task.creator_umo, task.creator_self_id
+                f"任务 #{task.id} 完成{self._result_tail(summary)}",
+                task.creator_umo, task.creator_self_id, task.creator_user_id,
             )
         elif status == "aborted":
             self.store.update(task.id, status="aborted", finished_at=now_iso())
             await self._broadcast(f"任务 #{task.id} 已取消", task.creator_umo, task.creator_self_id)
         else:
             self.store.update(task.id, status="failed", error=runner.error, finished_at=now_iso())
-            await self._broadcast(f"任务 #{task.id} 失败: {self._clip(runner.error)}", task.creator_umo, task.creator_self_id)
+            await self._broadcast(
+                f"任务 #{task.id} 失败: {self._clip(runner.error)}",
+                task.creator_umo, task.creator_self_id, task.creator_user_id,
+            )
 
     async def _on_run_event(self, task_id: str, kind: str, text: str):
         """run 进程事件 → 记录 + 限流推送"""
@@ -871,12 +919,15 @@ class RemoteTaskPlugin(Star):
             summary = ""
         if status == "done":
             self.store.update(task.id, status="done", summary=summary, finished_at=now_iso())
-            tail = f"\n结果: {self._clip(summary)}" if summary.strip() else "\n结果: （无文本输出）"
-            await self._broadcast(f"任务 #{task.id} 完成{tail}", task.creator_umo, task.creator_self_id)
+            await self._broadcast(
+                f"任务 #{task.id} 完成{self._result_tail(summary)}",
+                task.creator_umo, task.creator_self_id, task.creator_user_id,
+            )
         else:
             self.store.update(task.id, status="failed", error="serve 会话超时未完成", finished_at=now_iso())
             await self._broadcast(
-                f"任务 #{task.id} 超时未完成（无完成事件，已视为失败）", task.creator_umo, task.creator_self_id
+                f"任务 #{task.id} 超时未完成（无完成事件，已视为失败）",
+                task.creator_umo, task.creator_self_id, task.creator_user_id,
             )
 
     async def _on_serve_event(self, kind: str, session_id: str, text: str, meta=None):
