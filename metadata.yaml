@@ -1,4 +1,4 @@
-name: astrbot_plugin_remote_task
+﻿name: astrbot_plugin_remote_task
 display_name: 远程任务
 desc: opencode 远程任务助手：群里下发任务给 opencode 执行，自动选择 serve API 或本地 run，实时推送进度，支持取消与历史查询
 help: |
@@ -11,6 +11,6 @@ help: |
   - /任务 serve 状态|启动|停止：管理 opencode serve 后台进程
   管理命令（下发/取消/serve 管理）仅限配置的 admin_umos 白名单。
   run_work_dir 为必填配置，未配置时拒绝下发任务。
-version: 1.0.0
+version: 1.1.1
 author: yunxiao258
 repo: https://github.com/yunxiao258/astrbot_plugin_remote_task
