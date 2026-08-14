@@ -174,15 +174,16 @@ class TaskStore:
     def get(self, task_id: str) -> Task | None:
         return next((t for t in self._tasks if t.id == task_id), None)
 
-    def update(self, task_id: str, **fields):
-        """就地更新任务字段并按需保存"""
+    def update(self, task_id: str, save: bool = True, **fields):
+        """就地更新任务字段并按需保存（事件高频更新时可传 save=False 延迟落盘）"""
         t = self.get(task_id)
         if t is None:
             return None
         for k, v in fields.items():
             if hasattr(t, k):
                 setattr(t, k, v)
-        self.save()
+        if save:
+            self.save()
         return t
 
     def add_item(self, task_id: str, item: dict):

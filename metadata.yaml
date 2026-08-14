@@ -11,6 +11,6 @@ help: |
   - /任务 serve 状态|启动|停止：管理 opencode serve 后台进程
   管理命令（下发/取消/serve 管理）仅限配置的 admin_umos 白名单。
   run_work_dir 为必填配置，未配置时拒绝下发任务。
-version: 1.1.1
+version: 1.1.2
 author: yunxiao258
 repo: https://github.com/yunxiao258/astrbot_plugin_remote_task

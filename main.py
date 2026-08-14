@@ -42,7 +42,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.1.1",
+    "1.1.2",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -655,7 +655,8 @@ class RemoteTaskPlugin(Star):
         """run 进程事件 → 记录 + 限流推送"""
         self.store.add_item(task_id, {"t": now_iso(), "kind": kind, "text": text})
         if kind == "text":
-            self.store.update(task_id, summary=text[:2000])
+            # 事件高频触发，不落盘，任务终结时随状态变更统一保存
+            self.store.update(task_id, save=False, summary=text[:2000])
         elif kind == "permission":
             await self._broadcast(
                 f"任务 #{task_id} 请求权限（{text}）\n"
@@ -759,7 +760,8 @@ class RemoteTaskPlugin(Star):
             self._serve_activity[session_id] = self._loop.time()
         self.store.add_item(task_id, {"t": now_iso(), "kind": kind, "text": text})
         if kind == "text":
-            self.store.update(task_id, summary=text[:2000])
+            # 事件高频触发，不落盘，任务终结时随状态变更统一保存
+            self.store.update(task_id, save=False, summary=text[:2000])
         elif kind == "permission":
             meta = meta if isinstance(meta, dict) else {}
             self._task_permissions[task_id] = {

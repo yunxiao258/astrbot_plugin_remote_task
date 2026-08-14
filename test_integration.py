@@ -117,6 +117,7 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
     plugin._task_by_session = {}
     plugin._serve_done = set()
     plugin._task_permissions = {}
+    plugin._dedup = {}
     plugin.serve_client = None
     plugin.serve_manager = ServeManager(os.path.join(tmp_path, "serve.json"))
     plugin.context = FakeContext()
@@ -283,6 +284,67 @@ def test_approve_permission(tmp_path):
     run(go())
 
 
+def test_self_and_repeat_message(tmp_path):
+    print("[自消息与重复消息过滤]")
+    p = make_plugin(tmp_path)
+
+    class RawEvent(FakeEvent):
+        def __init__(self, message_str, raw_message, session=ADMIN_UMO):
+            super().__init__(message_str, session)
+            self.message_obj = type("M", (), {"raw_message": raw_message})()
+
+    async def go():
+        ev_self = RawEvent("下发 任务", {"user_id": "10000", "self_id": "10000"})
+        check("机器人自消息跳过", p._is_self_message(ev_self))
+        ev_other = RawEvent("下发 任务", {"user_id": "10000", "self_id": "20000"})
+        check("他人消息不跳过", not p._is_self_message(ev_other))
+        ev_no_raw = RawEvent("下发 任务", None)
+        check("无 raw_message 安全", not p._is_self_message(ev_no_raw))
+
+        ev1 = RawEvent("x", {"message_id": "m1"})
+        check("首条消息不重复", not p._is_repeat_message(ev1))
+        check("同 id 2 秒内重复", p._is_repeat_message(ev1))
+        ev2 = RawEvent("x", {"message_id": "m2"})
+        check("不同 id 不重复", not p._is_repeat_message(ev2))
+    run(go())
+
+
+def test_deferred_save_lifecycle(tmp_path):
+    print("[事件节流延迟落盘]")
+    from astrbot_plugin_remote_task.tracker import now_iso
+
+    store_path = os.path.join(tmp_path, "tasks.json")
+    p = make_plugin(tmp_path)
+    p.store = TaskStore(store_path, max_tasks=50)
+
+    t = p.store.add(Task(id="l1", desc="节流任务", creator_umo=ADMIN_UMO, mode="run"))
+    # 高频事件：仅内存更新，不落盘
+    p.store.update("l1", save=False, summary="第一段输出")
+    p.store.update("l1", save=False, summary="第二段输出")
+    with open(store_path, "r", encoding="utf-8") as fh:
+        import json as _json
+        on_disk = _json.load(fh)
+    disk_task = next((x for x in on_disk if x["id"] == "l1"), None)
+    check("save=False 不写盘", disk_task is None or disk_task.get("summary") != "第二段输出")
+    check("内存已更新 summary", p.store.get("l1").summary == "第二段输出")
+    # 任务终结：一次落盘带上最新 summary
+    p.store.update("l1", status="done", finished_at=now_iso())
+    with open(store_path, "r", encoding="utf-8") as fh:
+        on_disk = _json.load(fh)
+    disk_task = next((x for x in on_disk if x["id"] == "l1"), None)
+    check("终结时落盘最新 summary", disk_task is not None and disk_task["summary"] == "第二段输出")
+    check("终结状态持久化", disk_task["status"] == "done")
+
+    # 生命周期：重启加载后 running/pending 标记 failed
+    p.store.add(Task(id="l2", desc="中断任务", creator_umo=ADMIN_UMO, status="running"))
+    p.store.add(Task(id="l3", desc="排队任务", creator_umo=ADMIN_UMO, status="pending"))
+    store2 = TaskStore(store_path, max_tasks=50)
+    store2.load()
+    t2 = store2.get("l2")
+    check("重启后 running→failed", t2.status == "failed" and "中断" in t2.error)
+    check("重启后 pending→failed", store2.get("l3").status == "failed")
+
+
 def run_all(tmp_path):
     test_admin_gate(tmp_path)
     test_query_commands(tmp_path)
@@ -293,6 +355,8 @@ def run_all(tmp_path):
     test_approve_permission(tmp_path)
     test_utils(tmp_path)
     test_mode_report_reason(tmp_path)
+    test_self_and_repeat_message(tmp_path)
+    test_deferred_save_lifecycle(tmp_path)
 
 
 if __name__ == "__main__":
