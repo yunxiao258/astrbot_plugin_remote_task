@@ -1,4 +1,4 @@
-"""astrbot_plugin_remote_task 集成测试：命令分发、admin 白名单、任务下发链路。
+﻿"""astrbot_plugin_remote_task 集成测试：命令分发、admin 白名单、任务下发链路。
 
 运行：python test_integration.py
 需要 venv 中的 astrbot 包（@register 依赖），不启动 opencode serve。
@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
 
 from astrbot_plugin_remote_task.client import ServeManager
 from astrbot_plugin_remote_task.main import RemoteTaskPlugin
+from astrbot_plugin_remote_task.scheduler import ScheduleStore, ScheduleManager
 from astrbot_plugin_remote_task.tracker import ProgressHub, Task, TaskStore
 
 PASS = 0
@@ -83,6 +84,13 @@ class FakeEvent:
         self.sent_text = "".join(texts)
 
 
+_BROADCAST_LOG = []
+
+
+async def fake_broadcast(msg, umo, sid):
+    _BROADCAST_LOG.append(msg)
+
+
 def make_plugin(tmp_path, cfg_extra=None, session=None):
     cfg = FakeCfg(**{
         "enabled": True,
@@ -100,12 +108,19 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
         "max_tasks": 50,
         "progress_push": True,
         "broadcast_umo": "",
+        "retry_max": 0,
+        "retry_interval_seconds": 60,
+        "archive_max": 200,
         **(cfg_extra or {}),
     })
     plugin = RemoteTaskPlugin.__new__(RemoteTaskPlugin)
     plugin.cfg = cfg
     plugin.plugin_dir = _PLUGIN_DIR
-    plugin.store = TaskStore(os.path.join(tmp_path, "tasks.json"), max_tasks=50)
+    plugin.store = TaskStore(
+        os.path.join(tmp_path, "tasks.json"),
+        max_tasks=50,
+        archive_file=os.path.join(tmp_path, "archive.json"),
+    )
     plugin.store.load()
     try:
         plugin._loop = asyncio.get_running_loop()
@@ -120,6 +135,9 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
     plugin._dedup = {}
     plugin.serve_client = None
     plugin.serve_manager = ServeManager(os.path.join(tmp_path, "serve.json"))
+    plugin.schedule_store = ScheduleStore(os.path.join(tmp_path, "schedule.json"))
+    plugin.schedule_store.load()
+    plugin.schedule_manager = ScheduleManager(plugin.schedule_store, plugin._submit)
     plugin.context = FakeContext()
     return plugin
 
@@ -345,6 +363,133 @@ def test_deferred_save_lifecycle(tmp_path):
     check("重启后 pending→failed", store2.get("l3").status == "failed")
 
 
+def test_retry_chain(tmp_path):
+    print("[失败自动重试]")
+    p = make_plugin(tmp_path, cfg_extra={"retry_max": 2, "retry_interval_seconds": 1})
+    calls = {"n": 0}
+    messages = []
+
+    async def fake_run(task):
+        calls["n"] += 1
+        p.store.update(task.id, status="running")
+        if calls["n"] < 3:
+            p.store.update(task.id, status="failed", error="模拟失败")
+        else:
+            p.store.update(task.id, status="done", summary="成功", finished_at="t")
+
+    p._execute_run = fake_run
+
+    async def go():
+        t = Task(id="retry1", desc="重试任务", creator_umo=ADMIN_UMO, mode="run")
+        p.store.add(t)
+        _BROADCAST_LOG.clear()
+        p._broadcast = fake_broadcast
+        await p._execute(t)
+        check("失败后重试 3 次", calls["n"] == 3)
+        t2 = p.store.get("retry1")
+        check("最终成功", t2.status == "done")
+        check("retry_count 记录", t2.retry_count == 2)
+        check("重试广播提示", any("重试" in m for m in _BROADCAST_LOG))
+    run(go())
+
+
+def test_retry_not_for_aborted(tmp_path):
+    print("[取消不重试]")
+    p = make_plugin(tmp_path, cfg_extra={"retry_max": 5, "retry_interval_seconds": 1})
+    calls = {"n": 0}
+
+    async def fake_run(task):
+        calls["n"] += 1
+        p.store.update(task.id, status="aborted", finished_at="t")
+
+    p._execute_run = fake_run
+
+    async def go():
+        t = Task(id="ab1", desc="取消任务", creator_umo=ADMIN_UMO, mode="run")
+        p.store.add(t)
+        _BROADCAST_LOG.clear()
+        p._broadcast = fake_broadcast
+        await p._execute(t)
+        check("aborted 不触发重试", calls["n"] == 1)
+    run(go())
+
+
+def test_retry_zero_disabled(tmp_path):
+    print("[retry_max=0 不重试]")
+    p = make_plugin(tmp_path, cfg_extra={"retry_max": 0})
+    calls = {"n": 0}
+
+    async def fake_run(task):
+        calls["n"] += 1
+        p.store.update(task.id, status="failed", error="模拟失败")
+
+    p._execute_run = fake_run
+
+    async def go():
+        t = Task(id="no1", desc="不重试", creator_umo=ADMIN_UMO, mode="run")
+        p.store.add(t)
+        _BROADCAST_LOG.clear()
+        p._broadcast = fake_broadcast
+        await p._execute(t)
+        check("仅执行一次", calls["n"] == 1)
+        check("状态 failed", p.store.get("no1").status == "failed")
+    run(go())
+
+
+def test_schedule_commands(tmp_path):
+    print("[定时任务命令]")
+    p = make_plugin(tmp_path)
+
+    async def go():
+        r1 = await p._handle(FakeEvent("定时 0 9 * * * 每天早上汇总"))
+        check("创建定时任务", "已创建定时任务 #s1" in r1)
+        check("注册到调度器（无 cron_manager 为 0）", "已注册 0 个" in r1)
+
+        r2 = await p._handle(FakeEvent("定时 bad cron"))
+        check("非法 cron 拒绝", "cron 表达式格式不正确" in r2)
+
+        r3 = await p._handle(FakeEvent("定时 0 9 * * *"))
+        check("缺描述拒绝", "缺少任务描述" in r3)
+
+        r4 = await p._handle(FakeEvent("定时 列表"))
+        check("列表显示", "#s1" in r4 and "每天早上汇总" in r4)
+
+        r5 = await p._handle(FakeEvent("定时 删除 s1"))
+        check("删除成功", "已删除定时任务 s1" in r5)
+
+        r6 = await p._handle(FakeEvent("定时 删除 s1"))
+        check("重复删除提示不存在", "不存在" in r6)
+
+        r7 = await p._handle(FakeEvent("定时 列表"))
+        check("删除后列表空", "暂无定时任务" in r7)
+    run(go())
+
+
+def test_archive_commands(tmp_path):
+    print("[归档命令]")
+    p = make_plugin(tmp_path)
+    p.store.add(Task(id="arc1", desc="归档任务", creator_umo=ADMIN_UMO, mode="run",
+                     status="done", summary="ok", created_at="2026-08-05 10:00:00"))
+
+    async def go():
+        r1 = await p._handle(FakeEvent("归档"))
+        check("归档为空提示", "归档为空" in r1)
+
+        # 手动触发裁剪（把 arc1 挤进归档）
+        for i in range(60):
+            p.store._tasks.append(Task(id=f"z{i}", desc=f"x{i}", creator_umo="u"))
+        p.store.prune()
+        r2 = await p._handle(FakeEvent("归档"))
+        check("归档列表显示条目", "共" in r2 and "#arc1" in r2)
+
+        r3 = await p._handle(FakeEvent("归档 arc1"))
+        check("归档详情", "归档任务" in r3 and "归档任务" in r3)
+
+        r4 = await p._handle(FakeEvent("归档 nope"))
+        check("未知归档提示", "不存在" in r4)
+    run(go())
+
+
 def run_all(tmp_path):
     test_admin_gate(tmp_path)
     test_query_commands(tmp_path)
@@ -357,6 +502,11 @@ def run_all(tmp_path):
     test_mode_report_reason(tmp_path)
     test_self_and_repeat_message(tmp_path)
     test_deferred_save_lifecycle(tmp_path)
+    test_retry_chain(tmp_path)
+    test_retry_not_for_aborted(tmp_path)
+    test_retry_zero_disabled(tmp_path)
+    test_schedule_commands(tmp_path)
+    test_archive_commands(tmp_path)
 
 
 if __name__ == "__main__":

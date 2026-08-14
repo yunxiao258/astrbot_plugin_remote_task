@@ -27,6 +27,7 @@ from astrbot.api.star import Context, Star, register
 
 from .client import ServeClient, ServeManager
 from .runner import RunProcess, permission_rules_to_env
+from .scheduler import ScheduleEntry, ScheduleManager, ScheduleStore, validate_cron
 from .tracker import (
     ProgressHub,
     Task,
@@ -42,7 +43,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.1.2",
+    "1.2.0",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -54,10 +55,16 @@ class RemoteTaskPlugin(Star):
         self.store = TaskStore(
             os.path.join(data_dir, "tasks.json"),
             max_tasks=max(int(config.get("max_tasks", 50)), 1),
+            archive_file=os.path.join(data_dir, "archive.json"),
+            archive_max=max(int(config.get("archive_max", 200)), 1),
         )
         self.store.load()
         self._loop = asyncio.get_event_loop()
         self.hub = ProgressHub(self._on_progress)
+        # 定时任务
+        self.schedule_store = ScheduleStore(os.path.join(data_dir, "schedule.json"))
+        self.schedule_store.load()
+        self.schedule_manager = ScheduleManager(self.schedule_store, self._submit)
         # 执行资源
         self._watch: dict[str, asyncio.Task] = {}  # 任务监视协程
         self._runners: dict[str, RunProcess] = {}  # run 模式进程
@@ -82,7 +89,11 @@ class RemoteTaskPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """插件加载后启动 serve 事件监听（自动重连）"""
+        """插件加载后启动 serve 事件监听（自动重连）与注册定时任务"""
+        cron_manager = getattr(self.context, "cron_manager", None)
+        n = self.schedule_manager.register_all(cron_manager)
+        if n:
+            logger.info(f"【remote_task】已注册 {n} 个定时任务")
         if not self.serve_client:
             return
         if not self.cfg.get("serve_listen", True):
@@ -346,6 +357,18 @@ class RemoteTaskPlugin(Star):
             if not desc:
                 return "用法: /任务 下发 <任务描述>（或直接 /任务 <描述>）"
             return await self._submit(desc, str(event.session), self._event_self_id(event))
+        if cmd == "定时":
+            if not is_admin:
+                return self._deny()
+            return self._schedule_cmd(
+                tokens[1:] if len(tokens) > 1 else [],
+                str(event.session),
+                self._event_self_id(event),
+            )
+        if cmd in ("归档", "历史"):
+            if not is_admin:
+                return self._deny()
+            return self._archive_cmd(tokens[1:] if len(tokens) > 1 else [])
         # 默认整条视为任务描述
         if not is_admin:
             return self._deny()
@@ -357,8 +380,74 @@ class RemoteTaskPlugin(Star):
             "/任务 <描述> 下发任务（自动选执行模式）\n"
             "/任务列表 /任务详情 <id> /任务取消 <id>\n"
             "/任务 同意 <id> [always] 放行挂起权限 / /任务 拒绝 <id> 拒绝\n"
-            "/任务模式 /任务 serve 状态|启动|停止"
+            "/任务模式 /任务 serve 状态|启动|停止\n"
+            "/任务 定时 <cron> <描述> 创建定时任务（5 段 cron）\n"
+            "/任务 定时列表 / 定时 删除 <id>\n"
+            "/任务 归档 查看最近归档 / 归档 <id> 查看归档详情"
         )
+
+    # ---------- 定时任务与归档 ----------
+
+    def _cron_manager(self):
+        return getattr(self.context, "cron_manager", None)
+
+    def _schedule_cmd(self, args: list[str], creator_umo: str, creator_self_id: str) -> str:
+        if not args:
+            return "用法: /任务 定时 <cron> <任务描述>\n例: /任务 定时 0 9 * * * 汇总昨天的更新\ncron 为 5 段式（分 时 日 月 周）"
+        if args[0] in ("列表", "list"):
+            entries = self.schedule_store.all()
+            if not entries:
+                return "暂无定时任务。用法: /任务 定时 0 9 * * * <描述>"
+            lines = [f"定时任务（共 {len(entries)} 个）:", "━━━━━━━━━━━━━━━━━━"]
+            for e in reversed(entries):
+                state = "启用" if e.enabled else "停用"
+                lines.append(f"#{e.id} [{state}] {e.cron} {e.desc[:40]}")
+            return "\n".join(lines)
+        if args[0] in ("删除", "del", "remove"):
+            if len(args) < 2:
+                return "用法: /任务 定时 删除 <id>"
+            eid = args[1]
+            if not self.schedule_store.remove(eid):
+                return f"定时任务不存在: {eid}"
+            self.schedule_manager.remove_job(self._cron_manager(), eid)
+            return f"🗑️ 已删除定时任务 {eid}"
+        # 新建：cron 表达式（5 段）+ 描述
+        cron = " ".join(args[:5])
+        desc = " ".join(args[5:])
+        if not validate_cron(cron):
+            return "❌ cron 表达式格式不正确（应为 5 段: 分 时 日 月 周，如 0 9 * * *）"
+        if not desc:
+            return "❌ 缺少任务描述。用法: /任务 定时 <cron> <描述>"
+        used = {e.id for e in self.schedule_store.all()}
+        entry = ScheduleEntry(
+            entry_id=self.schedule_store.next_id(used),
+            cron=cron,
+            desc=desc,
+            creator_umo=creator_umo,
+            creator_self_id=creator_self_id,
+        )
+        self.schedule_store.add(entry)
+        n = self.schedule_manager.register_all(self._cron_manager())
+        return f"✅ 已创建定时任务 #{entry.id}（{cron}）: {desc}\n当前已注册 {n} 个定时任务到调度器"
+
+    def _archive_cmd(self, args: list[str]) -> str:
+        if not args:
+            all_archived = self.store.list_archived(0)
+            tasks = all_archived[-10:][::-1]
+            if not tasks:
+                return "归档为空。任务超过上限（max_tasks）被裁剪后会自动归档。"
+            lines = [f"📦 最近归档（共 {len(all_archived)} 条）:", "━━━━━━━━━━━━━━━━━━"]
+            lines.append(
+                "\n".join(
+                    f"#{t.id} [{status_label(t.status)}] {t.desc[:60]} @{t.created_at}"
+                    for t in tasks
+                )
+            )
+            return "\n".join(lines)
+        t = self.store.get_archived(args[0])
+        if t is None:
+            return f"归档中不存在任务: {args[0]}"
+        return format_task(t) + "\n(归档任务，不在当前列表)"
 
     # ---------- 权限与目标 ----------
 
@@ -590,10 +679,7 @@ class RemoteTaskPlugin(Star):
 
     async def _execute(self, task: Task):
         try:
-            if task.mode == "serve":
-                await self._execute_serve(task)
-            else:
-                await self._execute_run(task)
+            await self._execute_with_retry(task)
         except asyncio.CancelledError:
             # 被管理员取消：尽力终止遗留 run 进程后退出
             runner = self._runners.pop(task.id, None)
@@ -609,6 +695,50 @@ class RemoteTaskPlugin(Star):
             await self._broadcast(f"任务 #{task.id} 执行异常: {e}", task.creator_umo, task.creator_self_id)
         finally:
             self._watch.pop(task.id, None)
+
+    async def _execute_with_retry(self, task: Task):
+        """执行任务，失败时按配置自动重试（retry_max 次，间隔 retry_interval_seconds）"""
+        max_retries = max(0, int(self.cfg.get("retry_max", 0) or 0))
+        attempt = 0
+        while True:
+            if task.mode == "serve":
+                await self._execute_serve(task)
+            else:
+                await self._execute_run(task)
+            # 仅失败状态可重试（已取消/已完成/成功不重试）
+            if (
+                self._get_status(task.id) != "failed"
+                or attempt >= max_retries
+            ):
+                break
+            attempt += 1
+            delay = max(1, int(self.cfg.get("retry_interval_seconds", 60) or 60))
+            # 清掉旧运行资源引用（run 进程已结束；serve 会话映射已清理）
+            self._runners.pop(task.id, None)
+            self.store.update(
+                task.id,
+                status="pending",
+                error="",
+                finished_at="",
+                retry_count=attempt,
+            )
+            await self._broadcast(
+                f"任务 #{task.id} 第 {attempt}/{max_retries} 次重试（{delay} 秒后）",
+                task.creator_umo,
+                task.creator_self_id,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # 重试等待期间被取消：任务维持 pending 并在重启后归为 failed
+                raise
+        # 重试耗尽后最终失败状态补一次提示
+        if self._get_status(task.id) == "failed" and task.retry_count > 0 and attempt == max_retries:
+            await self._broadcast(
+                f"任务 #{task.id} 重试 {max_retries} 次后仍失败",
+                task.creator_umo,
+                task.creator_self_id,
+            )
 
     async def _execute_run(self, task: Task):
         if self._get_status(task.id) == "aborted":

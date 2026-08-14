@@ -176,6 +176,67 @@ def test_now_iso():
     check("ISO 格式", len(now_iso()) == 19 and " " in now_iso())
 
 
+def test_store_archive(tmp_path):
+    print("[归档]")
+    base = os.path.join(tmp_path, "arc_a")
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, "tasks.json")
+    arch = os.path.join(base, "archive.json")
+    store = TaskStore(path, max_tasks=3, archive_file=arch, archive_max=10)
+    store.load()
+    for i in range(5):
+        store.add(Task(id=f"a{i}", desc=f"任务{i}", creator_umo="u"))
+    check("超限裁剪到 3", len(store.list_recent()) == 3)
+    check("被裁剪任务进入归档", store.get_archived("a0") is not None)
+    check("归档内容保留", store.get_archived("a0").desc == "任务0")
+    check("当前列表不可见", store.get("a0") is None)
+    check("归档顺序新在前", store.list_archived(2)[0].id == "a1")
+    check("归档文件已落盘", os.path.exists(arch))
+
+    store2 = TaskStore(path, max_tasks=3, archive_file=arch)
+    store2.load()
+    check("重载后归档仍可查", store2.get_archived("a0") is not None)
+
+
+def test_store_archive_cap(tmp_path):
+    print("[归档上限]")
+    base = os.path.join(tmp_path, "arc_b")
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, "tasks.json")
+    arch = os.path.join(base, "archive.json")
+    store = TaskStore(path, max_tasks=2, archive_file=arch, archive_max=3)
+    store.load()
+    for i in range(6):
+        store.add(Task(id=f"c{i}", desc=f"任务{i}", creator_umo="u"))
+    archived = store.list_archived(0)
+    check("归档上限生效（≤3）", len(archived) <= 3)
+    check("保留最近的归档", "c3" in {t.id for t in archived})
+
+
+def test_store_no_archive_when_within_limit(tmp_path):
+    print("[未超限不归档]")
+    base = os.path.join(tmp_path, "arc_c")
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, "tasks.json")
+    arch = os.path.join(base, "archive.json")
+    store = TaskStore(path, max_tasks=10, archive_file=arch)
+    store.load()
+    for i in range(3):
+        store.add(Task(id=f"n{i}", desc=f"任务{i}", creator_umo="u"))
+    check("未超限无归档文件", not os.path.exists(arch))
+    check("归档列表为空", len(store.list_archived(0)) == 0)
+
+
+def test_task_retry_count_field(tmp_path):
+    print("[重试计数字段]")
+    t = Task(id="r1", desc="x", creator_umo="u", retry_count=2)
+    check("字段可设置", t.retry_count == 2)
+    t2 = Task.from_dict(t.to_dict())
+    check("to_dict/from_dict 往返", t2.retry_count == 2)
+    t3 = Task.from_dict({"id": "x", "desc": "y", "creator_umo": "z"})
+    check("旧数据缺省为 0", t3.retry_count == 0)
+
+
 def run_all(tmp_path):
     test_task_dataclass()
     test_status_label()
@@ -184,6 +245,10 @@ def run_all(tmp_path):
     test_store_recover_interrupted(tmp_path)
     test_store_update_and_items(tmp_path)
     test_store_damaged_file(tmp_path)
+    test_store_archive(tmp_path)
+    test_store_archive_cap(tmp_path)
+    test_store_no_archive_when_within_limit(tmp_path)
+    test_task_retry_count_field(tmp_path)
     test_format()
     test_progress_hub()
     test_now_iso()

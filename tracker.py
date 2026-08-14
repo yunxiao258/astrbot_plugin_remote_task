@@ -43,6 +43,7 @@ class Task:
     error: str = ""
     session_id: str = ""  # serve 模式的 opencode 会话 ID
     pid: int = 0  # run 模式的进程 PID
+    retry_count: int = 0  # 已自动重试次数
     items: list = field(default_factory=list)  # 进度节点记录
 
     def to_dict(self) -> dict:
@@ -63,6 +64,7 @@ class Task:
             error=d.get("error", ""),
             session_id=d.get("session_id", ""),
             pid=d.get("pid", 0),
+            retry_count=int(d.get("retry_count", 0) or 0),
             items=list(d.get("items") or []),
         )
 
@@ -117,14 +119,23 @@ class TaskStore:
     """任务持久化存储
 
     - save 时直接写 tasks.json（任务量小，无需原子写）
-    - 超限裁剪最旧任务
+    - 超限裁剪最旧任务（裁剪前写入 archive_file 归档）
     - 进度节点 items 有去重与限流能力（记录最近 N 条，避免刷屏存储）
     """
 
-    def __init__(self, data_file: str, max_tasks: int = 50, max_items_per_task: int = 20):
+    def __init__(
+        self,
+        data_file: str,
+        max_tasks: int = 50,
+        max_items_per_task: int = 20,
+        archive_file: str | None = None,
+        archive_max: int = 200,
+    ):
         self.data_file = data_file
         self.max_tasks = max(1, int(max_tasks))
         self.max_items = max(1, int(max_items_per_task))
+        self.archive_file = archive_file
+        self.archive_max = max(1, int(archive_max))
         self._tasks: list[Task] = []
 
     def _ensure_dir(self):
@@ -161,9 +172,55 @@ class TaskStore:
         except OSError as e:
             logger.warning(f"保存任务历史失败: {e}")
 
-    def prune(self):
-        if len(self._tasks) > self.max_tasks:
-            del self._tasks[: len(self._tasks) - self.max_tasks]
+    def _load_archived(self) -> list[Task]:
+        """读取归档文件（不存在或损坏时返回空列表）"""
+        if not self.archive_file or not os.path.exists(self.archive_file):
+            return []
+        try:
+            with open(self.archive_file, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            lst = raw if isinstance(raw, list) else raw.get("archived", [])
+            return [Task.from_dict(d) for d in lst]
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"读取任务归档失败: {e}")
+            return []
+
+    def _save_archived(self, tasks: list[Task]):
+        """覆写归档文件（仅保留最近 archive_max 条）"""
+        if not self.archive_file:
+            return
+        self._ensure_dir()
+        try:
+            with open(self.archive_file, "w", encoding="utf-8") as fh:
+                json.dump(
+                    [t.to_dict() for t in tasks],
+                    fh,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as e:
+            logger.warning(f"保存任务归档失败: {e}")
+
+    def prune(self, archive_max: int = 0):
+        if len(self._tasks) <= self.max_tasks:
+            return
+        dropped = self._tasks[: len(self._tasks) - self.max_tasks]
+        self._tasks = self._tasks[len(self._tasks) - self.max_tasks :]
+        if dropped and self.archive_file:
+            archived = self._load_archived()
+            archived.extend(dropped)
+            self._save_archived(archived[- (archive_max or self.archive_max):])
+
+    def list_archived(self, limit: int = 10) -> list[Task]:
+        """最近归档的任务（新 → 旧）"""
+        archived = self._load_archived()
+        return list(archived[-limit:])[::-1]
+
+    def get_archived(self, task_id: str) -> Task | None:
+        for t in self._load_archived():
+            if t.id == task_id:
+                return t
+        return None
 
     def add(self, t: Task) -> Task:
         self._tasks.append(t)

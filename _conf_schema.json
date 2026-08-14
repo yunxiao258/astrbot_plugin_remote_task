@@ -83,5 +83,20 @@
     "description": "任务进度/结果播报目标会话 UMO，多个用英文逗号分隔；留空则播报给下发任务的会话",
     "type": "string",
     "default": ""
+  },
+  "retry_max": {
+    "description": "任务失败后自动重试的最大次数（0 为不重试）",
+    "type": "int",
+    "default": 0
+  },
+  "retry_interval_seconds": {
+    "description": "自动重试之间的等待间隔（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "archive_max": {
+    "description": "归档文件保留的最大任务条数（超出丢弃最旧）",
+    "type": "int",
+    "default": 200
   }
 }
