@@ -177,6 +177,7 @@ class ScheduleManager:
         self.store = store
         self.submit = submit  # 回调: async (desc, creator_umo, creator_self_id) -> str
         self._registered: dict[str, str] = {}  # entry_id -> cron job 名称
+        self._pending_tasks: set = set()  # 持有 fire-and-forget 任务引用防 GC
         self._seq = 0
 
     def _job_name(self) -> str:
@@ -220,7 +221,10 @@ class ScheduleManager:
                         asyncio.get_running_loop()
                     except RuntimeError:
                         return
-                    asyncio.create_task(res)
+                    task = asyncio.create_task(res)
+                    # 保留引用防止 GC，并记录未捕获异常
+                    self._pending_tasks.add(task)
+                    task.add_done_callback(self._pending_tasks.discard)
             except Exception as ex:  # noqa: BLE001
                 logger.warning(f"定时任务 {entry.id} 触发失败: {ex}")
 

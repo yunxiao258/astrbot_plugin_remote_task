@@ -43,7 +43,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.2.0",
+    "1.2.1",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -529,7 +529,8 @@ class RemoteTaskPlugin(Star):
                 if sid:
                     seg = await AiocqhttpMessageEvent._parse_onebot_json(chain)
                     if not seg:
-                        return True
+                        # 解析失败：不能视为已发送，走 send_message 回退
+                        return False
                     if session.message_type == MessageType.GROUP_MESSAGE:
                         await plat.bot.send_group_msg(
                             group_id=int(session.session_id),
@@ -795,7 +796,7 @@ class RemoteTaskPlugin(Star):
                 self._creator_of(task_id),
                 self._creator_self_of(task_id),
             )
-        self.hub.emit(task_id, kind, text)
+        await self.hub.emit(task_id, kind, text)
 
     def _creator_of(self, task_id: str) -> str:
         t = self.store.get(task_id)
@@ -905,7 +906,7 @@ class RemoteTaskPlugin(Star):
                 self._creator_of(task_id),
                 self._creator_self_of(task_id),
             )
-        self.hub.emit(task_id, kind, text)
+        await self.hub.emit(task_id, kind, text)
 
     # ---------- 权限审批 ----------
 
@@ -1002,8 +1003,8 @@ class RemoteTaskPlugin(Star):
         if value.startswith("dpapi:") and os.name == "nt":
             import base64
 
-            raw = base64.b64decode(value[6:])
             try:
+                raw = base64.b64decode(value[6:])
                 return self._dpapi_unprotect(raw)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"dpapi 解密失败: {e}")

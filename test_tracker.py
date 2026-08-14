@@ -158,17 +158,35 @@ def test_format():
 def test_progress_hub():
     print("[进度限流]")
     seen = []
-    hub = ProgressHub(lambda tid, kind, text: seen.append((tid, kind, text)),
-                      min_interval_ms=0)
-    hub.emit("t", "tool", "bash git push")
-    hub.emit("t", "tool", "bash git push")
-    hub.emit("t", "tool", "bash git pull")
+
+    async def scenario():
+        hub = ProgressHub(lambda tid, kind, text: seen.append((tid, kind, text)),
+                          min_interval_ms=0)
+        await hub.emit("t", "tool", "bash git push")
+        await hub.emit("t", "tool", "bash git push")
+        await hub.emit("t", "tool", "bash git pull")
+
+    import asyncio
+    asyncio.run(scenario())
     check("相同事件连续去重", len(seen) == 2)
     check("不同事件放行", seen[-1][2] == "bash git pull")
 
-    hub2 = ProgressHub(lambda *a: None)
-    check("无指令集调用安全", hub2.should_emit("t:tool", "x") is True)
-    check("同文本短间隔去重", hub2.should_emit("t:tool", "x") is False)
+    async def scenario2():
+        hub2 = ProgressHub(lambda *a: None)
+        check("无指令集调用安全", hub2.should_emit("t:tool", "x") is True)
+        check("同文本短间隔去重", hub2.should_emit("t:tool", "x") is False)
+
+    asyncio.run(scenario2())
+
+    async def scenario3():
+        seen2 = []
+        async def acb(tid, kind, text):
+            seen2.append(text)
+        hub3 = ProgressHub(acb, min_interval_ms=0)
+        await hub3.emit("t", "tool", "async-ok")
+        check("异步回调被 await", seen2 == ["async-ok"])
+
+    asyncio.run(scenario3())
 
 
 def test_now_iso():

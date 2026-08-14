@@ -11,6 +11,7 @@
 保证状态机在任何时刻都能正确闭合。
 """
 
+import asyncio
 import json
 import os
 import time
@@ -293,9 +294,11 @@ class ProgressHub:
         self._last_event[dedup_key] = event_text
         return True
 
-    def emit(self, task_id: str, kind: str, text: str):
+    async def emit(self, task_id: str, kind: str, text: str):
         key = f"{task_id}:{kind}"
         if not self.should_emit(key, text):
             return
         if self.callback:
-            self.callback(task_id, kind, text)
+            res = self.callback(task_id, kind, text)
+            if asyncio.iscoroutine(res):
+                await res
