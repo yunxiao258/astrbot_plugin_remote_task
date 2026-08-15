@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
@@ -241,11 +242,64 @@ def test_serve_manager(tmp_path):
     check("无记录状态", "未托管" in mgr2.status())
 
 
+def test_listen_loop_backoff():
+    """监听失败指数退避：10 -> 20 -> 30 封顶；成功后恢复 5"""
+    print("[listen_loop 退避]")
+
+    sleeps = []
+
+    async def fail_once(*a, **k):
+        raise ConnectionRefusedError("模拟 serve 不可达")
+
+    async def record_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 4:
+            raise asyncio.CancelledError
+
+    async def run():
+        c = ServeClient("http://127.0.0.1:1")
+        with patch("asyncio.to_thread", side_effect=fail_once), \
+             patch("asyncio.sleep", side_effect=record_sleep):
+            try:
+                await c.listen_loop(lambda *a: None)
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+    check("退避间隔至少 4 次", len(sleeps) >= 4)
+    check("间隔 10 -> 20 -> 30", sleeps[:3] == [10, 20, 30])
+    check("30 秒封顶", max(sleeps) == 30)
+    check("未超过封顶", all(s <= 30 for s in sleeps))
+
+    sleeps2 = []
+
+    async def ok(*a, **k):
+        return None
+
+    async def record_sleep2(s):
+        sleeps2.append(s)
+        if len(sleeps2) >= 2:
+            raise asyncio.CancelledError
+
+    async def run2():
+        c = ServeClient("http://127.0.0.1:1")
+        with patch("asyncio.to_thread", side_effect=ok), \
+             patch("asyncio.sleep", side_effect=record_sleep2):
+            try:
+                await c.listen_loop(lambda *a: None)
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run2())
+    check("连接成功后恢复初始间隔", sleeps2[:2] == [5, 5])
+
+
 def run_all(tmp_path):
     test_parse_sse_payload()
     test_serve_api()
     test_serve_api_fallback_on_400(tmp_path)
     test_serve_manager(tmp_path)
+    test_listen_loop_backoff()
 
 
 if __name__ == "__main__":
