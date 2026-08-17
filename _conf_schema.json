@@ -89,6 +89,11 @@
     "type": "string",
     "default": ""
   },
+  "callback_target": {
+    "description": "任务结果回调推送目标：支持 UMO（如 default:GroupMessage:123）或 @群ID / u@用户ID（沿用下发会话平台），多个用英文逗号分隔；留空则仅当任务提交时带 --callback 参数才推送",
+    "type": "string",
+    "default": ""
+  },
   "retry_max": {
     "description": "任务失败后自动重试的最大次数（0 为不重试）",
     "type": "int",

@@ -17,7 +17,7 @@ import json
 import os
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.all import MessageChain
@@ -26,8 +26,10 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 from .client import ServeClient, ServeManager
+from .cron import CronExpr
 from .runner import RunProcess, permission_rules_to_env
 from .scheduler import ScheduleEntry, ScheduleManager, ScheduleStore, validate_cron
+from .templates import TEMPLATES, find_template
 from .tracker import (
     ProgressHub,
     Task,
@@ -301,11 +303,12 @@ class RemoteTaskPlugin(Star):
         if desc.startswith("任务跑 "):
             desc = desc[len("任务跑 "):].strip()
         if not desc:
-            text = "用法: /任务下发 <任务描述>"
+            text = "用法: /任务下发 <任务描述> [--callback @群ID|u@用户ID]"
         elif not self._is_admin(event):
             text = self._deny()
         else:
-            text = await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
+            desc, callback_raw = self._extract_callback(desc)
+            text = await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""), callback_raw)
         await self._safe_send(event, text)
 
     @filter.command("任务serve")
@@ -376,9 +379,10 @@ class RemoteTaskPlugin(Star):
             if not is_admin:
                 return self._deny()
             desc = " ".join(tokens[1:])
+            desc, callback_raw = self._extract_callback(desc)
             if not desc:
                 return "用法: /任务 下发 <任务描述>（或直接 /任务 <描述>）"
-            return await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
+            return await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""), callback_raw)
         if cmd == "定时":
             if not is_admin:
                 return self._deny()
@@ -391,10 +395,17 @@ class RemoteTaskPlugin(Star):
             if not is_admin:
                 return self._deny()
             return self._archive_cmd(tokens[1:] if len(tokens) > 1 else [])
+        if cmd in ("模板", "template"):
+            return await self._template_cmd(tokens[1:] if len(tokens) > 1 else [], event)
+        if cmd in ("日历", "calendar"):
+            if not is_admin:
+                return self._deny()
+            return self._calendar_cmd(tokens[1:] if len(tokens) > 1 else [])
         # 默认整条视为任务描述
         if not is_admin:
             return self._deny()
-        return await self._submit(" ".join(tokens), str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""))
+        desc, callback_raw = self._extract_callback(" ".join(tokens))
+        return await self._submit(desc, str(event.session), self._event_self_id(event), str(event.get_sender_id() or ""), callback_raw)
 
     def _usage(self) -> str:
         return (
@@ -405,6 +416,8 @@ class RemoteTaskPlugin(Star):
             "/任务模式 /任务 serve 状态|启动|停止\n"
             "/任务 定时 <cron> <描述> 创建定时任务（5 段 cron）\n"
             "/任务 定时列表 / 定时 删除 <id>\n"
+            "/任务 模板 列表 / 显示 <名称> / 创建 <名称> [k=v] 模板库\n"
+            "/任务 日历 [N] 未来 N 天任务排期（默认 7 天）\n"
             "/任务 归档 查看最近归档 / 归档 <id> 查看归档详情"
         )
 
@@ -436,6 +449,10 @@ class RemoteTaskPlugin(Star):
         # 新建：cron 表达式（5 段）+ 描述
         cron = " ".join(args[:5])
         desc = " ".join(args[5:])
+        return await self._create_schedule(cron, desc, creator_umo, creator_self_id)
+
+    async def _create_schedule(self, cron: str, desc: str, creator_umo: str, creator_self_id: str) -> str:
+        """创建一条定时任务并注册到调度器（定时命令与模板创建共用）"""
         if not validate_cron(cron):
             return "❌ cron 表达式格式不正确（应为 5 段: 分 时 日 月 周，如 0 9 * * *）"
         if not desc:
@@ -470,6 +487,157 @@ class RemoteTaskPlugin(Star):
         if t is None:
             return f"归档中不存在任务: {args[0]}"
         return format_task(t) + "\n(归档任务，不在当前列表)"
+
+    # ---------- 任务模板库 ----------
+
+    async def _template_cmd(self, args: list[str], event: AstrMessageEvent) -> str:
+        """任务模板库: 列表 / 显示 <名称> / 创建 <名称> [k=v]（创建走现有定时任务流程）"""
+        if not args:
+            return "用法: /任务 模板 列表 | 显示 <模板名称> | 创建 <模板名称> [参数k=v]\n例: /任务 模板 创建 每日备份 backup_dir=D:\\data"
+        sub = args[0]
+        if sub in ("列表", "list"):
+            lines = [f"📚 任务模板（共 {len(TEMPLATES)} 个）:", "━━━━━━━━━━━━━━━━━━"]
+            for tpl in TEMPLATES:
+                lines += tpl.to_lines()
+            lines.append("创建: /任务 模板 创建 <名称> [k=v]")
+            return "\n".join(lines)
+        if sub in ("显示", "show", "查看", "详情"):
+            if len(args) < 2:
+                return "用法: /任务 模板 显示 <模板名称>"
+            tpl = find_template(args[1])
+            if not tpl:
+                return f"模板不存在: {args[1]}"
+            return "\n".join(tpl.detail_lines())
+        if sub in ("创建", "create"):
+            if not self._is_admin(event):
+                return self._deny()
+            if len(args) < 2:
+                return "用法: /任务 模板 创建 <模板名称> [参数k=v]\n例: /任务 模板 创建 每日备份 backup_dir=D:\\data"
+            tpl = find_template(args[1])
+            if not tpl:
+                return f"模板不存在: {args[1]}"
+            cron, command, err = tpl.render(self._parse_kv(args[2:]))
+            if err:
+                return err
+            return await self._create_schedule(
+                cron, command, str(event.session), self._event_self_id(event)
+            )
+        return "用法: /任务 模板 列表 | 显示 <模板名称> | 创建 <模板名称> [参数k=v]"
+
+    @staticmethod
+    def _parse_kv(tokens: list[str]) -> dict:
+        """解析 k=v 形式的参数列表（容忍脏输入，非 k=v 的 token 直接忽略）"""
+        out = {}
+        for t in tokens or []:
+            if "=" in t:
+                k, _, v = t.partition("=")
+                k = k.strip()
+                if k:
+                    out[k] = v.strip()
+        return out
+
+    # ---------- 任务日历 ----------
+
+    def _calendar_cmd(self, args: list[str]) -> str:
+        """任务日历: 未来 N 天（默认 7，上限 30）各定时任务的触发排期"""
+        if args:
+            try:
+                n = int(args[0])
+            except (TypeError, ValueError):
+                return "用法: /任务 日历 [天数]（天数须为正整数，默认 7）"
+        else:
+            n = 7
+        n = max(1, min(n, 30))
+        entries = [e for e in self.schedule_store.all() if e.enabled]
+        if not entries:
+            return "暂无启用的定时任务，日历为空"
+        # 从下一分钟起算，避免把当前分钟误计入
+        now = datetime.now()
+        start = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        by_day: dict = {}
+        for e in entries:
+            expr = CronExpr.parse(e.cron)
+            if expr is None:
+                continue  # 脏 cron 跳过，不崩溃
+            for dt in expr.next_runs(start, n):
+                by_day.setdefault(dt.date(), []).append((dt.strftime("%H:%M"), e))
+        if not by_day:
+            return f"📅 未来 {n} 天内无定时任务触发排期"
+        lines = [f"📅 任务日历（未来 {n} 天）:", "━━━━━━━━━━━━━━━━━━"]
+        for day in sorted(by_day):
+            lines.append(f"{day} 周{'一二三四五六日'[day.weekday()]}")
+            for tstr, e in sorted(by_day[day], key=lambda x: x[0]):
+                lines.append(f"  {tstr}  #{e.id} [启用] {e.desc[:40]}")
+        return "\n".join(lines)
+
+    # ---------- 结果回调推送 ----------
+
+    @staticmethod
+    def _extract_callback(desc: str) -> tuple[str, str]:
+        """从任务描述中提取 --callback <目标>（或 --callback=<目标>），返回 (剩余描述, 回调目标原始串)"""
+        tokens = (desc or "").split()
+        kept: list[str] = []
+        callback = ""
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t in ("--callback", "--cb", "-c") and i + 1 < len(tokens):
+                callback = tokens[i + 1]
+                i += 2
+                continue
+            if t.startswith("--callback="):
+                callback = t[len("--callback="):]
+                i += 1
+                continue
+            kept.append(t)
+            i += 1
+        return " ".join(kept).strip(), callback.strip()
+
+    def _resolve_callback_targets(self, raw: str, session: str = "") -> list[str]:
+        """把回调目标原始串解析为 UMO 列表。
+
+        - @群ID       → 沿用会话平台的群聊 UMO（platform:GroupMessage:<id>）
+        - u@用户ID    → 沿用会话平台的私聊用户 UMO（platform:PrivateMessage:<id>）
+        - 其他        → 按逗号分隔视为完整 UMO 透传
+        无效项静默丢弃，返回去重后的列表。
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+        platform = (session or "").split(":")[0] or "default"
+        out: list[str] = []
+        for item in raw.replace("，", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if item.startswith("@"):
+                gid = item[1:].strip()
+                if gid.isdigit():
+                    out.append(f"{platform}:GroupMessage:{gid}")
+                continue
+            if item.lower().startswith("u@"):
+                uid = item[2:].strip()
+                if uid.isdigit():
+                    out.append(f"{platform}:PrivateMessage:{uid}")
+                continue
+            out.append(item)
+        seen: set[str] = set()
+        return [u for u in out if not (u in seen or seen.add(u))]
+
+    async def _push_result_callback(self, task: Task, text: str):
+        """任务结果回调推送：把结果摘要发到任务/配置指定的回调目标（群或用户 UMO）。
+
+        无回调目标时静默跳过，维持原有播报行为。
+        """
+        raw = (task.callback_target or "").strip() or str(self.cfg.get("callback_target", "") or "").strip()
+        targets = self._resolve_callback_targets(raw, task.creator_umo)
+        if not targets:
+            return
+        for umo in targets:
+            try:
+                await self._send_chain(umo, MessageChain([Plain(text)]), task.creator_self_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"结果回调推送到 {umo} 失败: {e!r}")
 
     # ---------- 权限与目标 ----------
 
@@ -713,7 +881,12 @@ class RemoteTaskPlugin(Star):
     # ---------- 任务执行 ----------
 
     async def _submit(
-        self, desc: str, creator_umo: str, creator_self_id: str = "", creator_user_id: str = ""
+        self,
+        desc: str,
+        creator_umo: str,
+        creator_self_id: str = "",
+        creator_user_id: str = "",
+        callback_raw: str = "",
     ) -> str:
         mode, reason = self._decide_mode()
         if mode == "不可执行":
@@ -726,6 +899,9 @@ class RemoteTaskPlugin(Star):
                 creator_self_id=creator_self_id,
                 creator_user_id=creator_user_id,
                 mode=mode,
+                callback_target=",".join(
+                    self._resolve_callback_targets(callback_raw, creator_umo)
+                ),
             )
         )
         logger.info(f"任务 #{task.id} 下发（{mode}）: {desc}")
@@ -758,6 +934,7 @@ class RemoteTaskPlugin(Star):
             logger.exception(f"任务 #{task.id} 执行异常")
             self.store.update(task.id, status="failed", error=str(e), finished_at=now_iso())
             await self._broadcast(f"任务 #{task.id} 执行异常: {e}", task.creator_umo, task.creator_self_id)
+            await self._push_result_callback(task, f"📬 任务 #{task.id} 执行异常: {e}")
         finally:
             self._watch.pop(task.id, None)
 
@@ -842,6 +1019,11 @@ class RemoteTaskPlugin(Star):
                 f"任务 #{task.id} 完成{self._result_tail(summary)}",
                 task.creator_umo, task.creator_self_id, task.creator_user_id,
             )
+            rc = runner.returncode if runner.returncode is not None else 0
+            await self._push_result_callback(
+                task,
+                f"📬 任务 #{task.id} 完成（退出码 {rc}）{self._result_tail(summary)}",
+            )
         elif status == "aborted":
             self.store.update(task.id, status="aborted", finished_at=now_iso())
             await self._broadcast(f"任务 #{task.id} 已取消", task.creator_umo, task.creator_self_id)
@@ -850,6 +1032,10 @@ class RemoteTaskPlugin(Star):
             await self._broadcast(
                 f"任务 #{task.id} 失败: {self._clip(runner.error)}",
                 task.creator_umo, task.creator_self_id, task.creator_user_id,
+            )
+            await self._push_result_callback(
+                task,
+                f"📬 任务 #{task.id} 失败{self._result_tail(runner.error)}",
             )
 
     async def _on_run_event(self, task_id: str, kind: str, text: str):
@@ -945,11 +1131,19 @@ class RemoteTaskPlugin(Star):
                 f"任务 #{task.id} 完成{self._result_tail(summary)}",
                 task.creator_umo, task.creator_self_id, task.creator_user_id,
             )
+            await self._push_result_callback(
+                task,
+                f"📬 任务 #{task.id} 完成（serve API）{self._result_tail(summary)}",
+            )
         else:
             self.store.update(task.id, status="failed", error="serve 会话超时未完成", finished_at=now_iso())
             await self._broadcast(
                 f"任务 #{task.id} 超时未完成（无完成事件，已视为失败）",
                 task.creator_umo, task.creator_self_id, task.creator_user_id,
+            )
+            await self._push_result_callback(
+                task,
+                f"📬 任务 #{task.id} 失败（serve 会话超时未完成）",
             )
 
     async def _on_serve_event(self, kind: str, session_id: str, text: str, meta=None):

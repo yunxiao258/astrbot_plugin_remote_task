@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
 
 from astrbot_plugin_remote_task.client import ServeManager
 from astrbot_plugin_remote_task.main import RemoteTaskPlugin
-from astrbot_plugin_remote_task.scheduler import ScheduleStore, ScheduleManager
+from astrbot_plugin_remote_task.scheduler import ScheduleEntry, ScheduleStore, ScheduleManager
 from astrbot_plugin_remote_task.tracker import ProgressHub, Task, TaskStore
 
 PASS = 0
@@ -533,6 +533,202 @@ def test_archive_commands(tmp_path):
     run(go())
 
 
+def test_template_commands():
+    print("[任务模板库命令]")
+    with tempfile.TemporaryDirectory() as t:
+        p = make_plugin(t)
+
+        async def go():
+            r1 = await p._handle(FakeEvent("模板 列表"))
+            check("模板列表含数量", "共 6 个" in r1)
+            check("模板列表含每日备份", "每日备份" in r1)
+            check("模板列表含健康检查", "定时健康检查" in r1)
+
+            r2 = await p._handle(FakeEvent("模板 显示 每日备份"))
+            check("模板详情含 cron", "0 2 * * *" in r2)
+            check("模板详情含参数", "backup_dir" in r2)
+
+            r3 = await p._handle(FakeEvent("模板 显示 nope"))
+            check("未知模板提示", "不存在" in r3)
+
+            r4 = await p._handle(FakeEvent("template list"))
+            check("英文子命令可用", "共 6 个" in r4)
+
+            r5 = await p._handle(FakeEvent("模板 创建 每日备份 backup_dir=D:\\data"))
+            check("模板创建定时任务", "已创建定时任务 #s1" in r5)
+
+            r6 = await p._handle(FakeEvent("定时 列表"))
+            check("模板任务进入定时列表", "#s1" in r6 and "备份目录" in r6)
+
+            r7 = await p._handle(FakeEvent("模板 创建 每日备份"))
+            check("缺必填参数报错", "缺少参数" in r7)
+
+            r8 = await p._handle(FakeEvent("模板 创建 nope"))
+            check("未知模板创建拒绝", "不存在" in r8)
+
+            r9 = await p._handle(FakeEvent("模板 创建 每日备份 backup_dir=D:\\data",
+                                           session="default:GroupMessage:111"))
+            check("非管理员拒绝创建", "没有执行此命令的权限" in r9)
+
+            r10 = await p._handle(FakeEvent("模板 创建 daily_backup backup_dir=D:\\x backup_root=E:\\bak"))
+            check("英文名+多参数创建", "已创建定时任务 #s2" in r10)
+
+            r11 = await p._handle(FakeEvent("模板"))
+            check("无子命令给用法", "用法" in r11)
+
+            r12 = await p._handle(FakeEvent("模板 创建 每周统计日报"))
+            check("有默认参数模板创建", "已创建定时任务 #s3" in r12)
+            r13 = await p._handle(FakeEvent("定时 列表"))
+            check("默认参数渲染进描述", "最近 7 天" in r13)
+        run(go())
+
+
+def test_calendar_command():
+    print("[任务日历命令]")
+    with tempfile.TemporaryDirectory() as t:
+        p = make_plugin(t)
+
+        async def go():
+            r0 = await p._handle(FakeEvent("日历"))
+            check("无定时任务日历为空", "暂无启用的定时任务" in r0)
+
+            await p._create_schedule("0 9 * * *", "每天早上汇总", ADMIN_UMO, "self")
+            await p._create_schedule("*/30 * * * *", "每半小时巡检", ADMIN_UMO, "self")
+
+            r1 = await p._handle(FakeEvent("日历"))
+            check("日历标题", "任务日历" in r1)
+            check("日历含任务一", "#s1" in r1 and "每天早上汇总" in r1)
+            check("日历含 09:00", "09:00" in r1)
+            check("日历含任务二", "每半小时巡检" in r1)
+            check("日历含日期", "2026" in r1)
+            check("日历含星期", "周" in r1)
+
+            r2 = await p._handle(FakeEvent("日历 3"))
+            check("指定天数", "未来 3 天" in r2)
+
+            r3 = await p._handle(FakeEvent("日历 abc"))
+            check("非法天数提示用法", "用法" in r3)
+
+            r4 = await p._handle(FakeEvent("日历 0"))
+            check("0 天钳制为 1", "未来 1 天" in r4)
+
+            r4b = await p._handle(FakeEvent("calendar 2"))
+            check("英文子命令可用", "未来 2 天" in r4b)
+
+            # 脏 cron 条目不崩溃、不出现
+            p.schedule_store.add(ScheduleEntry("s9", "bad cron", "脏任务", ADMIN_UMO))
+            r5 = await p._handle(FakeEvent("日历"))
+            check("脏 cron 不崩溃", "任务日历" in r5 and "#s9" not in r5)
+
+            r7 = await p._handle(FakeEvent("日历", session="default:GroupMessage:111"))
+            check("非管理员拒绝日历", "没有执行此命令的权限" in r7)
+        run(go())
+
+
+def test_calendar_no_upcoming():
+    print("[日历无排期提示]")
+    with tempfile.TemporaryDirectory() as t:
+        p = make_plugin(t)
+
+        async def go():
+            # 只有周日触发的任务，未来 1 天（今天周一）无排期
+            await p._create_schedule("15 3 * * 0", "周日下午提醒", ADMIN_UMO, "self")
+            r = await p._handle(FakeEvent("日历 1"))
+            check("未来 1 天无排期提示", "无定时任务触发" in r)
+        run(go())
+
+
+def test_callback_targets(tmp_path):
+    print("[回调目标解析]")
+    p = make_plugin(tmp_path)
+    check("@群ID 解析",
+          p._resolve_callback_targets("@123", "default:GroupMessage:1") == ["default:GroupMessage:123"])
+    check("用户 UMO 解析",
+          p._resolve_callback_targets("u@123", "onebot:GroupMessage:1") == ["onebot:PrivateMessage:123"])
+    check("完整 UMO 透传",
+          p._resolve_callback_targets("onebot:GroupMessage:9", "default:x:1") == ["onebot:GroupMessage:9"])
+    check("混合列表",
+          p._resolve_callback_targets("onebot:GroupMessage:9, @7", "default:x:1")
+          == ["onebot:GroupMessage:9", "default:GroupMessage:7"])
+    check("空串为空", p._resolve_callback_targets("", "default:x:1") == [])
+    check("None 为空", p._resolve_callback_targets(None, "default:x:1") == [])
+    check("非法 @ 忽略", p._resolve_callback_targets("@abc", "default:x:1") == [])
+    check("去重", len(p._resolve_callback_targets("@1,@1", "default:x:1")) == 1)
+    check("中文逗号兼容",
+          p._resolve_callback_targets("@1，@2", "default:x:1")
+          == ["default:GroupMessage:1", "default:GroupMessage:2"])
+
+
+def test_callback_push(tmp_path):
+    print("[结果回调推送]")
+    p = make_plugin(tmp_path)
+
+    async def go():
+        # 任务指定回调目标
+        t1 = Task(id="cb1", desc="x", creator_umo=ADMIN_UMO, callback_target="default:GroupMessage:999")
+        p.store.add(t1)
+        await p._push_result_callback(t1, "任务完成摘要")
+        hit = [u for u, _ in p.context.sent if u == "default:GroupMessage:999"]
+        check("任务回调目标收到推送", len(hit) == 1)
+        check("推送内容正确", any("任务完成摘要" in str(c.chain[0].text) for _, c in p.context.sent))
+
+        # 无任务回调目标 + 无配置 → 不推送
+        p.context.sent.clear()
+        t2 = Task(id="cb2", desc="x", creator_umo=ADMIN_UMO)
+        p.store.add(t2)
+        await p._push_result_callback(t2, "不应发出")
+        check("无回调目标不推送", len(p.context.sent) == 0)
+
+        # 配置回调目标（@ 形式，沿用下发会话平台）
+        p2 = make_plugin(tmp_path, cfg_extra={"callback_target": "@888"})
+        t3 = Task(id="cb3", desc="x", creator_umo=ADMIN_UMO)
+        p2.store.add(t3)
+        await p2._push_result_callback(t3, "配置回调摘要")
+        check("配置回调目标推送", any(u == "default:GroupMessage:888" for u, _ in p2.context.sent))
+        check("配置 @ 不叠加任务回调", not any(u == "default:GroupMessage:999" for u, _ in p2.context.sent))
+
+        # 多目标推送
+        p.context.sent.clear()
+        t4 = Task(id="cb4", desc="x", creator_umo=ADMIN_UMO,
+                  callback_target="default:GroupMessage:1,default:GroupMessage:2")
+        p.store.add(t4)
+        await p._push_result_callback(t4, "多目标")
+        umos = [u for u, _ in p.context.sent]
+        check("多目标全部推送", umos.count("default:GroupMessage:1") == 1 and umos.count("default:GroupMessage:2") == 1)
+    run(go())
+
+
+def test_submit_with_callback(tmp_path):
+    print("[提交携带回调参数]")
+    p = make_plugin(tmp_path)
+    work = os.path.join(tmp_path, "work")
+    os.makedirs(work, exist_ok=True)
+
+    desc, cb = p._extract_callback("检查磁盘 --callback @123")
+    check("提取 --callback", desc == "检查磁盘" and cb == "@123")
+    desc2, cb2 = p._extract_callback("--callback=@5 跑一下")
+    check("提取 --callback=", desc2 == "跑一下" and cb2 == "@5")
+    desc3, cb3 = p._extract_callback("普通任务")
+    check("无回调参数", desc3 == "普通任务" and cb3 == "")
+    desc4, cb4 = p._extract_callback("--callback @9 跑一下 --callback @8")
+    check("后者覆盖", desc4 == "跑一下" and cb4 == "@8")
+    desc5, cb5 = p._extract_callback("--callback @9")
+    check("仅回调参数描述为空", desc5 == "" and cb5 == "@9")
+
+    async def go():
+        r = await p._handle(FakeEvent("下发 检查磁盘 --callback @123"))
+        check("受理成功", "已受理" in r)
+        task = p.store.list_recent()[-1]
+        check("回调目标落库", task.callback_target == "default:GroupMessage:123")
+        # 等 watcher 收尾（opencode 不存在 → 启动失败，触发失败回调）
+        for _ in range(30):
+            if not p._watch:
+                break
+            await asyncio.sleep(0.2)
+        check("失败回调已推送", any("default:GroupMessage:123" in u for u, _ in p.context.sent))
+    run(go())
+
+
 def run_all(tmp_path):
     test_admin_gate(tmp_path)
     test_query_commands(tmp_path)
@@ -550,6 +746,12 @@ def run_all(tmp_path):
     test_retry_zero_disabled(tmp_path)
     test_schedule_commands(tmp_path)
     test_archive_commands(tmp_path)
+    test_template_commands()
+    test_calendar_command()
+    test_calendar_no_upcoming()
+    test_callback_targets(tmp_path)
+    test_callback_push(tmp_path)
+    test_submit_with_callback(tmp_path)
 
 
 if __name__ == "__main__":

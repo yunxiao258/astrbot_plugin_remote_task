@@ -152,6 +152,7 @@ class RunProcess:
         self.cancelled = False
         self.last_output_at = 0.0
         self.error = ""
+        self.returncode: int | None = None  # 进程退出码（结束前为 None）
 
     @property
     def pid(self) -> int:
@@ -193,6 +194,7 @@ class RunProcess:
         if self.proc.returncode is not None:
             # 进程已结束（如取消时刚好终止）
             rc = self.proc.returncode
+            self.returncode = rc
             if rc != 0 and not self.error:
                 self.error = f"退出码 {rc}"
             return "done" if rc == 0 else "failed"
@@ -225,6 +227,7 @@ class RunProcess:
             if ev:
                 await self._emit(*ev)
         rc = await self.proc.wait()
+        self.returncode = rc
         err = await self.proc.stderr.read()
         if err:
             self.error = err.decode("utf-8", errors="replace").strip()[-300:]

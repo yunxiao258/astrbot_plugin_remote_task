@@ -46,6 +46,7 @@ class Task:
     session_id: str = ""  # serve 模式的 opencode 会话 ID
     pid: int = 0  # run 模式的进程 PID
     retry_count: int = 0  # 已自动重试次数
+    callback_target: str = ""  # 结果回调推送目标（解析后的 UMO 列表，逗号分隔；空则不推送）
     items: list = field(default_factory=list)  # 进度节点记录
 
     def to_dict(self) -> dict:
@@ -68,6 +69,7 @@ class Task:
             session_id=d.get("session_id", ""),
             pid=d.get("pid", 0),
             retry_count=int(d.get("retry_count", 0) or 0),
+            callback_target=d.get("callback_target", ""),
             items=list(d.get("items") or []),
         )
 
