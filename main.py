@@ -84,21 +84,43 @@ class RemoteTaskPlugin(Star):
             os.path.join(data_dir, "serve.json"),
             opencode_exe=config.get("opencode_exe", "") or None,
         )
+        self._serve_listening = False
+        self._bg_task = None
 
     # ---------- 生命周期 ----------
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """插件加载后启动 serve 事件监听（自动重连）与注册定时任务"""
-        cron_manager = getattr(self.context, "cron_manager", None)
-        n = self.schedule_manager.register_all(cron_manager)
-        if n:
-            logger.info(f"【remote_task】已注册 {n} 个定时任务")
-        if not self.serve_client:
-            return
-        if not self.cfg.get("serve_listen", True):
-            return
-        asyncio.create_task(self._serve_listener())
+        """插件加载后注册定时任务与 serve 监听（投递后台，避免阻塞钩子）"""
+        self.initialize()
+
+    def initialize(self):
+        """插件热重载后初始化：注册定时任务 + 启动 serve 监听（幂等）"""
+        try:
+            self._bg_task = asyncio.create_task(self._start_background())
+            self._bg_task.add_done_callback(self._on_bg_done)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"【remote_task】后台任务启动失败: {e}")
+
+    def _on_bg_done(self, task):
+        self._bg_task = None
+
+    async def _start_background(self):
+        """注册定时任务 + 启动 serve 监听（幂等，重复调用不叠加）"""
+        try:
+            cron_manager = self._cron_manager()
+            n = await self.schedule_manager.register_all(cron_manager)
+            if n:
+                logger.info(f"【remote_task】已注册 {n} 个定时任务")
+            if not self.serve_client:
+                return
+            if not self.cfg.get("serve_listen", True):
+                return
+            if not self._serve_listening:
+                self._serve_listening = True
+                await self._serve_listener()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"【remote_task】后台初始化失败: {e}")
 
     async def _serve_listener(self):
         if self.serve_client:
@@ -360,7 +382,7 @@ class RemoteTaskPlugin(Star):
         if cmd == "定时":
             if not is_admin:
                 return self._deny()
-            return self._schedule_cmd(
+            return await self._schedule_cmd(
                 tokens[1:] if len(tokens) > 1 else [],
                 str(event.session),
                 self._event_self_id(event),
@@ -391,7 +413,7 @@ class RemoteTaskPlugin(Star):
     def _cron_manager(self):
         return getattr(self.context, "cron_manager", None)
 
-    def _schedule_cmd(self, args: list[str], creator_umo: str, creator_self_id: str) -> str:
+    async def _schedule_cmd(self, args: list[str], creator_umo: str, creator_self_id: str) -> str:
         if not args:
             return "用法: /任务 定时 <cron> <任务描述>\n例: /任务 定时 0 9 * * * 汇总昨天的更新\ncron 为 5 段式（分 时 日 月 周）"
         if args[0] in ("列表", "list"):
@@ -409,7 +431,7 @@ class RemoteTaskPlugin(Star):
             eid = args[1]
             if not self.schedule_store.remove(eid):
                 return f"定时任务不存在: {eid}"
-            self.schedule_manager.remove_job(self._cron_manager(), eid)
+            await self.schedule_manager.remove_job(self._cron_manager(), eid)
             return f"🗑️ 已删除定时任务 {eid}"
         # 新建：cron 表达式（5 段）+ 描述
         cron = " ".join(args[:5])
@@ -427,7 +449,7 @@ class RemoteTaskPlugin(Star):
             creator_self_id=creator_self_id,
         )
         self.schedule_store.add(entry)
-        n = self.schedule_manager.register_all(self._cron_manager())
+        n = await self.schedule_manager.register_all(self._cron_manager())
         return f"✅ 已创建定时任务 #{entry.id}（{cron}）: {desc}\n当前已注册 {n} 个定时任务到调度器"
 
     def _archive_cmd(self, args: list[str]) -> str:

@@ -5,6 +5,7 @@
 - 支持「定时 列表 / 定时 删除」管理命令
 """
 
+import asyncio
 import json
 import os
 import re
@@ -184,7 +185,7 @@ class ScheduleManager:
         self._seq += 1
         return f"remote_task_sched_{int(time.time())}_{self._seq}"
 
-    def register_all(self, cron_manager) -> int:
+    async def register_all(self, cron_manager) -> int:
         """把启用的定时任务注册进调度器，返回成功注册数（无 cron_manager 返回 0）"""
         if cron_manager is None:
             return 0
@@ -194,7 +195,7 @@ class ScheduleManager:
                 continue
             try:
                 name = self._job_name()
-                cron_manager.add_basic_job(
+                await cron_manager.add_basic_job(
                     name=name,
                     cron_expression=e.cron,
                     handler=self._make_handler(e),
@@ -230,15 +231,15 @@ class ScheduleManager:
 
         return handler
 
-    def remove_job(self, cron_manager, entry_id: str):
+    async def remove_job(self, cron_manager, entry_id: str):
         """删除调度器中的注册（若存在）"""
         name = self._registered.pop(entry_id, None)
         if name and cron_manager is not None:
             try:
-                cron_manager.delete_job(name)
+                await cron_manager.delete_job(name)
             except Exception as ex:  # noqa: BLE001
                 logger.warning(f"删除定时任务 {entry_id} 注册失败: {ex}")
 
-    def clear_all(self, cron_manager):
+    async def clear_all(self, cron_manager):
         for eid in list(self._registered):
-            self.remove_job(cron_manager, eid)
+            await self.remove_job(cron_manager, eid)

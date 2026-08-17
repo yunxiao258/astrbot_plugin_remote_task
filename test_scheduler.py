@@ -4,6 +4,7 @@
 不依赖 AstrBot 运行实例与真实调度器（用假 cron_manager）。
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -85,10 +86,10 @@ def test_manager_register():
         def __init__(self):
             self.jobs = []
 
-        def add_basic_job(self, **kwargs):
+        async def add_basic_job(self, **kwargs):
             self.jobs.append(kwargs)
 
-        def delete_job(self, name):
+        async def delete_job(self, name):
             self.jobs = [j for j in self.jobs if j["name"] != name]
 
     cron = FakeCron()
@@ -99,7 +100,7 @@ def test_manager_register():
 
     submitted = []
     mgr = ScheduleManager(store, lambda desc, umo, sid: submitted.append((desc, umo, sid)))
-    n = mgr.register_all(cron)
+    n = asyncio.run(mgr.register_all(cron))
     check("仅注册合法启用条目", n == 1)
     check("job 名称生成", len(cron.jobs) == 1 and "remote_task_sched" in cron.jobs[0]["name"])
     check("cron 表达式透传", cron.jobs[0]["cron_expression"] == "0 9 * * *")
@@ -109,13 +110,13 @@ def test_manager_register():
     check("handler 触发提交", len(submitted) == 1 and submitted[0][0] == "a")
 
     # 删除注册
-    mgr.remove_job(cron, "s1")
+    asyncio.run(mgr.remove_job(cron, "s1"))
     check("注销后 job 移除", len(cron.jobs) == 0)
-    mgr.remove_job(cron, "s1")
+    asyncio.run(mgr.remove_job(cron, "s1"))
     check("重复注销安全", len(cron.jobs) == 0)
 
     mgr2 = ScheduleManager(store, lambda *a: None)
-    check("无 cron_manager 注册 0", mgr2.register_all(None) == 0)
+    check("无 cron_manager 注册 0", asyncio.run(mgr2.register_all(None)) == 0)
 
 
 def run_all(tmp_path):
