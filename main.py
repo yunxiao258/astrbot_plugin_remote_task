@@ -1,4 +1,4 @@
-﻿"""AstrBot 插件：opencode 远程任务助手。
+"""AstrBot 插件：opencode 远程任务助手。
 
 通过群聊把任务下发给本机 opencode 执行：
 - 执行模式自动选择：opencode serve API 优先，不可用时降级到本地 opencode run 进程
@@ -45,7 +45,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.2.1",
+    "1.2.2",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):

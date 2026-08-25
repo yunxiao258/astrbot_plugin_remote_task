@@ -337,19 +337,34 @@ class ServeClient:
             return False
 
     async def listen_loop(self, on_event: Callable[[str, str, str], Coroutine], loop=None):
-        """SSE 事件监听循环（断线自动重连，失败时指数退避避免刷屏）"""
+        """SSE 事件监听循环（断线自动重连，失败指数退避避免刷屏）。
+
+        退避 5 → 10 → 20 → … → 300 秒封顶；连续失败时仅首次与每 10 次
+        打 WARN，其余降为 DEBUG，长时间未开 serve 也不会刷屏；
+        连接恢复后打 INFO 提示并重置退避。
+        """
         backoff = 5
+        fail_streak = 0
         while True:
             try:
                 await asyncio.to_thread(self._listen_once, on_event, loop)
+                if fail_streak:
+                    logger.info("serve 事件监听已恢复连接")
+                fail_streak = 0
                 # 连接成功后断线：恢复初始间隔
                 backoff = 5
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"serve 事件监听异常: {e}")
-                # 连续失败退避 5 -> 10 -> 20 -> 30 秒封顶
-                backoff = min(backoff * 2, 30)
+                fail_streak += 1
+                backoff = min(backoff * 2, 300)
+                if fail_streak == 1 or fail_streak % 10 == 0:
+                    logger.warning(
+                        f"serve 事件监听异常（第 {fail_streak} 次，"
+                        f"{backoff} 秒后重试）: {e}"
+                    )
+                else:
+                    logger.debug(f"serve 事件监听异常: {e}")
             await asyncio.sleep(backoff)
 
     def _listen_once(self, on_event, loop):
