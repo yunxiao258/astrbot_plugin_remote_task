@@ -119,7 +119,8 @@ def test_run_failure_exit(tmp_path):
 def test_run_no_output_timeout(tmp_path):
     print("[无输出超时]")
     r = RunProcess("t3", "x", tmp_path, timeout_no_output=30,
-                   cmd_override=[sys.executable, "-c", "import time; print('ok', flush=True); time.sleep(60)"])
+                   cmd_override=[sys.executable, "-c", "import time; print('ok', flush=True); time.sleep(10)"])
+    r.timeout_no_output = 1  # 跳过 30s 下限以加速测试
     async def go():
         assert await r.start()
         return await r.wait()
@@ -131,7 +132,7 @@ def test_run_no_output_timeout(tmp_path):
 def test_run_cancel(tmp_path):
     print("[取消]")
     r = RunProcess("t4", "x", tmp_path, timeout_no_output=120,
-                   cmd_override=[sys.executable, "-c", "import time; time.sleep(60)"])
+                   cmd_override=[sys.executable, "-c", "import time; time.sleep(10)"])
     async def go():
         assert await r.start()
         await asyncio.sleep(1.0)

@@ -153,6 +153,17 @@ class ServeClient:
             raw = f"{username or 'opencode'}:{password}".encode()
             self.auth = {"Authorization": "Basic " + base64.b64encode(raw).decode()}
         self._requests = None
+        self._active_resp = None
+
+    def close(self):
+        """关闭进行中的 SSE 长连接，配合插件卸载唤醒阻塞线程"""
+        resp = self._active_resp
+        self._active_resp = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _get_requests(self):
         if self._requests is None:
@@ -371,32 +382,40 @@ class ServeClient:
         r = self._get_requests().get(
             f"{self.base_url}/global/event",
             stream=True,
-            timeout=None,
+            timeout=(10, 90),
             headers=self._headers(),
             proxies=self._no_proxy(),
         )
+        self._active_resp = r
         event = ""
         data_lines = []
-        for raw in r.iter_lines(decode_unicode=True):
-            if raw is None:
-                continue
-            if raw.startswith("event:"):
-                event = raw[len("event:"):].strip()
-            elif raw.startswith("data:"):
-                data_lines.append(raw[len("data:"):].strip())
-            elif raw == "":
-                if event and data_lines:
-                    ev = parse_sse_payload(event, "\n".join(data_lines))
-                    if ev:
-                        kind, sid, text, meta = ev
-                        if loop is not None:
-                            asyncio.run_coroutine_threadsafe(
-                                on_event(kind, sid, text, meta), loop
-                            )
-                        else:
-                            asyncio.run(on_event(kind, sid, text, meta))
-                event = ""
-                data_lines = []
+        try:
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw is None:
+                    continue
+                if raw.startswith("event:"):
+                    event = raw[len("event:"):].strip()
+                elif raw.startswith("data:"):
+                    data_lines.append(raw[len("data:"):].strip())
+                elif raw == "":
+                    if event and data_lines:
+                        ev = parse_sse_payload(event, "\n".join(data_lines))
+                        if ev:
+                            kind, sid, text, meta = ev
+                            if loop is not None:
+                                asyncio.run_coroutine_threadsafe(
+                                    on_event(kind, sid, text, meta), loop
+                                )
+                            else:
+                                asyncio.run(on_event(kind, sid, text, meta))
+                    event = ""
+                    data_lines = []
+        finally:
+            self._active_resp = None
+            try:
+                r.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------- serve 进程托管 ----------------
@@ -493,7 +512,24 @@ class ServeManager:
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                                capture_output=True, timeout=15)
             else:
-                os.kill(pid, 15)
+                import signal
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(15):
+                    try:
+                        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+                        if waited_pid == pid:
+                            break
+                    except ChildProcessError:
+                        pass
+                    if not self._pid_running(pid):
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, os.WNOHANG)
+                    except (OSError, ChildProcessError):
+                        pass
         except (OSError, subprocess.SubprocessError) as e:
             return f"停止失败: {e}"
         self._info = {}

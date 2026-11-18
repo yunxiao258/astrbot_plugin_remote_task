@@ -2,11 +2,13 @@
 """remote_task listen_loop 退避与日志降级测试（v1.2.2）。"""
 
 import asyncio
+import os
 import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, r"D:\astrbot\data\plugins")
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
 
 from astrbot_plugin_remote_task.client import ServeClient  # noqa: E402
 

@@ -49,6 +49,11 @@
     "type": "bool",
     "default": false
   },
+  "run_permission_allow": {
+    "description": "本地 run 权限规则 JSON（如 {\"bash\":\"allow\"}），注入 opencode 内联配置避免 headless 模式权限挂起",
+    "type": "string",
+    "default": ""
+  },
   "run_no_output_timeout_seconds": {
     "description": "本地 run 模式进程无新输出超时（秒），超时视为卡住并终止，最小 30",
     "type": "int",
@@ -60,7 +65,7 @@
     "default": 60
   },
   "admin_umos": {
-    "description": "管理员会话 UMO 白名单（如 default:GroupMessage:1102410958），多个用英文逗号分隔；必须配置，否则管理命令全部拒绝",
+    "description": "管理员会话 UMO 白名单（如 default:GroupMessage:1234567890），多个用英文逗号分隔；必须配置，否则管理命令全部拒绝",
     "type": "string",
     "default": ""
   },

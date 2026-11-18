@@ -2,7 +2,7 @@
 
 AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行，自动选择 serve API 或本地 run，实时推送进度，支持取消、历史查询、定时任务与任务模板库。
 
-版本：v1.2.1 | 许可证：MIT
+版本：v1.3.0 | 许可证：MIT
 
 ## 功能
 
@@ -44,6 +44,8 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 | `/任务 模板 创建 <名称> [k=v]` | 用模板创建定时任务（仅管理员，缺必填参数会提示） |
 | `/任务 日历 [天数]` | 查看未来 N 天定时任务触发排期（默认 7 天，上限 30） |
 | `/任务 归档 [id]` | 查看归档任务列表（省略 id 时列出最近归档） |
+| `/任务 日志 <id> [N]` | 查看任务最近 N 条执行节点日志与错误信息（支持归档任务） |
+| `/任务 重试 <id>` | 按原描述与回调目标重新下发已完成/失败/取消的任务（仅管理员） |
 
 > 命令均支持英文别名：`/task`、`/任务列表` 等；模板子命令可用英文（`template list` 等），日历可用 `calendar`。
 > 下发 / 取消 / serve 管理 / 定时 / 模板创建 / 日历 / 归档仅限 `admin_umos` 白名单；未配置白名单时管理命令全部拒绝（查询类命令不受限）。
@@ -63,7 +65,7 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 | 写法 | 说明 |
 | --- | --- |
 | `--callback @123` | 推送到会话所在平台的群 123（`platform:GroupMessage:123`） |
-| `--callback u@456` | 推送到会话所在平台的用户 456（`platform:PrivateMessage:456`） |
+| `--callback u@456` | 推送到会话所在平台的用户 456（`platform:FriendMessage:456`） |
 | `--callback default:GroupMessage:9` | 完整 UMO 透传，可同时写多个（英文逗号分隔） |
 
 - 例：`/任务 检查磁盘 --callback @123`
@@ -98,7 +100,7 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 | `opencode_exe` | 空 | opencode 可执行文件路径（留空自动从 PATH 查找） |
 | `run_work_dir` | 空 | 本地 run 模式的工作目录（必填，不存在时拒绝下发） |
 | `run_auto_approve` | `false` | 本地 run 是否自动批准未显式拒绝的权限（严格模式建议 `false`） |
-| `run_permission_allow` | 空 | 本地 run 权限规则（JSON，如 `{"bash":"allow"}`），注入 opencode 内联配置，避免 headless 模式权限挂起（代码读取，未在 `_conf_schema.json` 中声明） |
+| `run_permission_allow` | 空 | 本地 run 权限规则（JSON，如 `{"bash":"allow"}`），注入 opencode 内联配置，避免 headless 模式权限挂起 |
 | `run_no_output_timeout_seconds` | `120` | 本地 run 无新输出超时（秒，最小 30），超时视为卡住并终止 |
 | `serve_idle_complete_seconds` | `60` | serve 会话空闲判完成阈值（秒，最小 30） |
 | `admin_umos` | 空 | 管理员会话 UMO 白名单（逗号分隔，必须配置，否则管理命令全部拒绝） |
@@ -137,6 +139,18 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 - 本地 run 模式需要 `opencode` 在 PATH（或配置 `opencode_exe`）
 
 ## 更新记录
+
+### v1.3.0
+
+- 修复 `initialize()` 为同步函数导致 AstrBot v4.27.2 加载时 `TypeError: object NoneType can't be used in 'await' expression` 失败的问题，补充 `async def terminate()` 清理后台任务与 SSE 长连接
+- 修复 `--callback u@用户ID` 拼接无效消息类型 `PrivateMessage` 的 bug，改为 `FriendMessage`
+- 移除 `__init__` 对 `asyncio.get_event_loop()` 的直接依赖，改用运行时事件循环与 `time.monotonic()`
+- 新增 `/任务 日志 <id> [N]`（查看进度节点与错误日志，兼容归档任务）与 `/任务 重试 <id>`（一键重跑历史任务）
+- `_conf_schema.json` 补齐 `run_permission_allow` 配置项声明
+
+### v1.2.2
+
+- 优化 serve 监听断线退避上限至 300 秒，连续失败日志降级（仅首次与每 10 次打 WARN），恢复连接自动提示
 
 ### v1.2.1
 

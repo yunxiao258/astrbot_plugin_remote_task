@@ -181,7 +181,12 @@ def test_serve_api():
         body = json.loads(FakeHandler.permission_bodies[-1])
         check("审批 body response", body.get("response") == "always")
 
-        c2 = ServeClient("http://127.0.0.1:1")
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        unused_port = sock.getsockname()[1]
+        sock.close()
+        c2 = ServeClient(f"http://127.0.0.1:{unused_port}")
         check("不可达 probe False", c2.probe() is False)
         check("不可达 create_session None", c2.create_session() is None)
         check("不可达 send_prompt False", c2.send_prompt("x", "y") is False)
@@ -243,7 +248,7 @@ def test_serve_manager(tmp_path):
 
 
 def test_listen_loop_backoff():
-    """监听失败指数退避：10 -> 20 -> 30 封顶；成功后恢复 5"""
+    """监听失败指数退避：10 -> 20 -> 40 -> ... -> 300 封顶；成功后恢复 5"""
     print("[listen_loop 退避]")
 
     sleeps = []
@@ -253,7 +258,7 @@ def test_listen_loop_backoff():
 
     async def record_sleep(s):
         sleeps.append(s)
-        if len(sleeps) >= 4:
+        if len(sleeps) >= 8:
             raise asyncio.CancelledError
 
     async def run():
@@ -266,10 +271,10 @@ def test_listen_loop_backoff():
                 pass
 
     asyncio.run(run())
-    check("退避间隔至少 4 次", len(sleeps) >= 4)
-    check("间隔 10 -> 20 -> 30", sleeps[:3] == [10, 20, 30])
-    check("30 秒封顶", max(sleeps) == 30)
-    check("未超过封顶", all(s <= 30 for s in sleeps))
+    check("退避间隔至少 8 次", len(sleeps) >= 8)
+    check("间隔 10 -> 20 -> 40", sleeps[:3] == [10, 20, 40])
+    check("300 秒封顶", max(sleeps) == 300)
+    check("未超过封顶", all(s <= 300 for s in sleeps))
 
     sleeps2 = []
 

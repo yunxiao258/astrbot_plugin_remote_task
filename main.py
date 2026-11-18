@@ -45,7 +45,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "yunxiao258",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.2.2",
+    "1.3.0",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -61,7 +61,7 @@ class RemoteTaskPlugin(Star):
             archive_max=max(int(config.get("archive_max", 200)), 1),
         )
         self.store.load()
-        self._loop = asyncio.get_event_loop()
+        self._loop = None
         self.hub = ProgressHub(self._on_progress)
         # 定时任务
         self.schedule_store = ScheduleStore(os.path.join(data_dir, "schedule.json"))
@@ -87,25 +87,57 @@ class RemoteTaskPlugin(Star):
             opencode_exe=config.get("opencode_exe", "") or None,
         )
         self._serve_listening = False
-        self._bg_task = None
+        self._bg_task: asyncio.Task | None = None
 
     # ---------- 生命周期 ----------
 
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self):
-        """插件加载后注册定时任务与 serve 监听（投递后台，避免阻塞钩子）"""
-        self.initialize()
+    def _get_loop(self):
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        return self._loop
 
-    def initialize(self):
-        """插件热重载后初始化：注册定时任务 + 启动 serve 监听（幂等）"""
+    async def initialize(self):
+        """插件加载/热重载后异步初始化：注册定时任务 + 启动 serve 监听（幂等）"""
+        self._get_loop()
+        bg = getattr(self, "_bg_task", None)
+        if bg is not None and not bg.done():
+            return
         try:
             self._bg_task = asyncio.create_task(self._start_background())
             self._bg_task.add_done_callback(self._on_bg_done)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"【remote_task】后台任务启动失败: {e}")
 
-    def _on_bg_done(self, task):
+    async def terminate(self):
+        """插件卸载/重载时清理后台监听、SSE 连接与监视任务"""
+        self._serve_listening = False
+        sc = getattr(self, "serve_client", None)
+        if sc and hasattr(sc, "close"):
+            sc.close()
+        tasks_to_cancel: list[asyncio.Task] = []
+        bg = getattr(self, "_bg_task", None)
+        if bg and not bg.done():
+            bg.cancel()
+            tasks_to_cancel.append(bg)
+        for watcher in list(getattr(self, "_watch", {}).values()):
+            if watcher and not watcher.done():
+                watcher.cancel()
+                tasks_to_cancel.append(watcher)
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        for runner in list(getattr(self, "_runners", {}).values()):
+            try:
+                await runner.cancel()
+            except Exception:  # noqa: BLE001
+                pass
         self._bg_task = None
+
+    def _on_bg_done(self, task):
+        if task is self._bg_task:
+            self._bg_task = None
+        self._serve_listening = False
 
     async def _start_background(self):
         """注册定时任务 + 启动 serve 监听（幂等，重复调用不叠加）"""
@@ -121,12 +153,16 @@ class RemoteTaskPlugin(Star):
             if not self._serve_listening:
                 self._serve_listening = True
                 await self._serve_listener()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"【remote_task】后台初始化失败: {e}")
+        finally:
+            self._serve_listening = False
 
     async def _serve_listener(self):
         if self.serve_client:
-            await self.serve_client.listen_loop(self._on_serve_event, self._loop)
+            await self.serve_client.listen_loop(self._on_serve_event, self._get_loop())
 
     # ---------- 命令 ----------
 
@@ -395,6 +431,19 @@ class RemoteTaskPlugin(Star):
             if not is_admin:
                 return self._deny()
             return self._archive_cmd(tokens[1:] if len(tokens) > 1 else [])
+        if cmd in ("日志", "log", "logs"):
+            if len(tokens) < 2:
+                return "用法: /任务 日志 <id> [条数]"
+            limit = 10
+            if len(tokens) > 2 and tokens[2].isdigit():
+                limit = max(1, min(int(tokens[2]), 50))
+            return self._logs_cmd(tokens[1], limit)
+        if cmd in ("重试", "retry"):
+            if not is_admin:
+                return self._deny()
+            if len(tokens) < 2:
+                return "用法: /任务 重试 <id>"
+            return await self._retry_task_cmd(tokens[1], event)
         if cmd in ("模板", "template"):
             return await self._template_cmd(tokens[1:] if len(tokens) > 1 else [], event)
         if cmd in ("日历", "calendar"):
@@ -418,7 +467,45 @@ class RemoteTaskPlugin(Star):
             "/任务 定时列表 / 定时 删除 <id>\n"
             "/任务 模板 列表 / 显示 <名称> / 创建 <名称> [k=v] 模板库\n"
             "/任务 日历 [N] 未来 N 天任务排期（默认 7 天）\n"
-            "/任务 归档 查看最近归档 / 归档 <id> 查看归档详情"
+            "/任务 归档 查看最近归档 / 归档 <id> 查看归档详情\n"
+            "/任务 日志 <id> [N] 查看任务执行节点日志 / /任务 重试 <id> 重新下发任务"
+        )
+
+    def _logs_cmd(self, task_id: str, limit: int = 10) -> str:
+        """查看任务进度节点与错误日志（含归档任务）"""
+        t = self.store.get(task_id) or self.store.get_archived(task_id)
+        if not t:
+            return f"任务不存在: {task_id}"
+        items = list(t.items or [])
+        lines = [f"📋 任务 #{t.id} [{status_label(t.status)}] 日志"]
+        if not items:
+            lines.append("（暂无过程节点记录）")
+        else:
+            tail = items[-limit:]
+            if len(items) > len(tail):
+                lines.append(f"（仅显示最近 {len(tail)}/{len(items)} 条）")
+            for it in tail:
+                ts = it.get("t", "")
+                kind = it.get("kind", "")
+                txt = str(it.get("text", "")).replace("\n", " ")[:120]
+                lines.append(f"[{ts}] ({kind}) {txt}")
+        if t.error:
+            lines.append(f"错误: {t.error}")
+        return "\n".join(lines)
+
+    async def _retry_task_cmd(self, task_id: str, event: AstrMessageEvent) -> str:
+        """按原描述与回调目标重新下发任务"""
+        t = self.store.get(task_id) or self.store.get_archived(task_id)
+        if not t:
+            return f"任务不存在: {task_id}"
+        if t.status in ("pending", "running"):
+            return f"任务 #{t.id} 当前仍在{status_label(t.status)}，无需重试"
+        return await self._submit(
+            t.desc,
+            str(event.session),
+            self._event_self_id(event),
+            str(event.get_sender_id() or ""),
+            t.callback_target,
         )
 
     # ---------- 定时任务与归档 ----------
@@ -597,7 +684,7 @@ class RemoteTaskPlugin(Star):
         """把回调目标原始串解析为 UMO 列表。
 
         - @群ID       → 沿用会话平台的群聊 UMO（platform:GroupMessage:<id>）
-        - u@用户ID    → 沿用会话平台的私聊用户 UMO（platform:PrivateMessage:<id>）
+        - u@用户ID    → 沿用会话平台的私聊用户 UMO（platform:FriendMessage:<id>）
         - 其他        → 按逗号分隔视为完整 UMO 透传
         无效项静默丢弃，返回去重后的列表。
         """
@@ -618,7 +705,7 @@ class RemoteTaskPlugin(Star):
             if item.lower().startswith("u@"):
                 uid = item[2:].strip()
                 if uid.isdigit():
-                    out.append(f"{platform}:PrivateMessage:{uid}")
+                    out.append(f"{platform}:FriendMessage:{uid}")
                 continue
             out.append(item)
         seen: set[str] = set()
@@ -1089,22 +1176,23 @@ class RemoteTaskPlugin(Star):
         )
         timeout = max(30, int(self.cfg.get("run_no_output_timeout_seconds", 120)) * 6)
         idle_limit = max(30, int(self.cfg.get("serve_idle_complete_seconds", 60)))
-        deadline = self._loop.time() + timeout
+        deadline = time.monotonic() + timeout
         completed = False
         last_poll = 0.0
-        while self._loop.time() < deadline:
+        while time.monotonic() < deadline:
             if self._get_status(task.id) == "aborted":
                 break
             if sid in self._serve_done:
                 completed = True
                 break
-            if self._loop.time() - last_poll >= 5:
-                last_poll = self._loop.time()
+            now_mono = time.monotonic()
+            if now_mono - last_poll >= 5:
+                last_poll = now_mono
                 if await asyncio.to_thread(self.serve_client.is_finished, sid):
                     completed = True
                     break
             if sid in self._serve_activity and (
-                self._loop.time() - self._serve_activity[sid] > idle_limit
+                now_mono - self._serve_activity[sid] > idle_limit
             ):
                 # 长时间无会话事件，视为执行完毕
                 completed = True
@@ -1155,7 +1243,7 @@ class RemoteTaskPlugin(Star):
             self._serve_done.add(session_id)
         else:
             # 任何非结束事件都视为会话活动（用于空闲判完成）
-            self._serve_activity[session_id] = self._loop.time()
+            self._serve_activity[session_id] = time.monotonic()
         self.store.add_item(task_id, {"t": now_iso(), "kind": kind, "text": text})
         if kind == "text":
             # 事件高频触发，不落盘，任务终结时随状态变更统一保存

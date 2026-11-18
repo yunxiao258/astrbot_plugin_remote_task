@@ -138,6 +138,8 @@ def make_plugin(tmp_path, cfg_extra=None, session=None):
     plugin._task_permissions = {}
     plugin._dedup = {}
     plugin.serve_client = None
+    plugin._bg_task = None
+    plugin._serve_listening = False
     plugin.serve_manager = ServeManager(os.path.join(tmp_path, "serve.json"))
     plugin.schedule_store = ScheduleStore(os.path.join(tmp_path, "schedule.json"))
     plugin.schedule_store.load()
@@ -163,7 +165,7 @@ def test_mention_creator_and_result_tail(tmp_path):
     check("文本仍随消息链", "任务完成" in "".join(c.text for c in chain.chain if hasattr(c, "text")))
 
     # 私聊/非 onebot 不 @
-    chain2 = p._build_chain("x", "onebot:PrivateMessage:1", "10001")
+    chain2 = p._build_chain("x", "onebot:FriendMessage:1", "10001")
     check("私聊不 @", not any(isinstance(c, At) for c in chain2.chain))
     chain3 = p._build_chain("x", "default:GroupMessage:1", "10001")
     check("非 onebot 平台不 @", not any(isinstance(c, At) for c in chain3.chain))
@@ -644,7 +646,7 @@ def test_callback_targets(tmp_path):
     check("@群ID 解析",
           p._resolve_callback_targets("@123", "default:GroupMessage:1") == ["default:GroupMessage:123"])
     check("用户 UMO 解析",
-          p._resolve_callback_targets("u@123", "onebot:GroupMessage:1") == ["onebot:PrivateMessage:123"])
+          p._resolve_callback_targets("u@123", "onebot:GroupMessage:1") == ["onebot:FriendMessage:123"])
     check("完整 UMO 透传",
           p._resolve_callback_targets("onebot:GroupMessage:9", "default:x:1") == ["onebot:GroupMessage:9"])
     check("混合列表",
@@ -729,6 +731,48 @@ def test_submit_with_callback(tmp_path):
     run(go())
 
 
+def test_logs_retry_and_lifecycle(tmp_path):
+    print("[日志 / 重试 / 异步生命周期]")
+    import inspect
+    check("initialize 为协程函数", inspect.iscoroutinefunction(RemoteTaskPlugin.initialize))
+    check("terminate 为协程函数", inspect.iscoroutinefunction(RemoteTaskPlugin.terminate))
+
+    p = make_plugin(tmp_path, cfg_extra={"serve_listen": False})
+    t = Task(
+        id="log1",
+        desc="echo test",
+        creator_umo=ADMIN_UMO,
+        mode="run",
+        status="failed",
+        error="exit code 1",
+        callback_target="@888",
+        items=[{"t": "2026-11-18 10:00:00", "kind": "tool", "text": "bash echo hi"}],
+    )
+    p.store.add(t)
+
+    async def go():
+        # 初始化与卸载不报错、可 await
+        await p.initialize()
+        await p.terminate()
+        # 日志查看
+        r_log = await p._handle(FakeEvent("日志 log1"))
+        check("日志包含节点内容", "bash echo hi" in r_log and "exit code 1" in r_log)
+        r_miss = await p._handle(FakeEvent("日志 nope"))
+        check("不存在任务提示", "不存在" in r_miss)
+        # 重试非管理员被拒
+        r_deny = await p._handle(FakeEvent("重试 log1", session="default:GroupMessage:999"))
+        check("非管理员重试拒绝", "权限" in r_deny or "白名单" in r_deny)
+        # 管理员重试已结束任务
+        os.makedirs(p._work_dir(), exist_ok=True)
+        r_retry = await p._handle(FakeEvent("重试 log1"))
+        check("重试受理成功", "已受理" in r_retry and "echo test" in r_retry)
+        for _ in range(30):
+            if not p._watch:
+                break
+            await asyncio.sleep(0.1)
+    run(go())
+
+
 def run_all(tmp_path):
     test_admin_gate(tmp_path)
     test_query_commands(tmp_path)
@@ -752,6 +796,7 @@ def run_all(tmp_path):
     test_callback_targets(tmp_path)
     test_callback_push(tmp_path)
     test_submit_with_callback(tmp_path)
+    test_logs_retry_and_lifecycle(tmp_path)
 
 
 if __name__ == "__main__":
