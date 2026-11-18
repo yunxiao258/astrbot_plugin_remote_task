@@ -65,7 +65,16 @@ jobs:
                   GROUP_MESSAGE = "GroupMessage"
                   FRIEND_MESSAGE = "FriendMessage"
                   OTHER_MESSAGE = "OtherMessage"
+              class MessageMember:
+                  def __init__(self, user_id="", nickname="", **kw):
+                      self.user_id = user_id
+                      self.nickname = nickname
+              class AstrBotMessage:
+                  def __init__(self, **kw):
+                      self.__dict__.update(kw)
           ''')
+
+          w("core/__init__.py", "astrbot_config = {}\n")
 
           w("core/message/components.py", '''
               class BaseMessageComponent: pass
@@ -154,10 +163,15 @@ jobs:
               class PermissionType(str, Enum):
                   ADMIN = "admin"
                   MEMBER = "member"
+              def _wrap(fn):
+                  if callable(fn):
+                      fn.command = _dec
+                      fn.group = _dec
+                  return fn
               def _dec(*a, **kw):
                   if a and callable(a[0]) and len(a) == 1 and not kw:
-                      return a[0]
-                  return lambda fn: fn
+                      return _wrap(a[0])
+                  return _wrap
               command = command_group = regex = event_message_type = permission_type = on_message = on_astrbot_loaded = on_plugin_loaded = on_plugin_unloaded = on_plugin_error = on_llm_request = on_llm_response = on_decorating_result = after_message_sent = _dec
           ''')
 

@@ -289,7 +289,11 @@ def test_utils(tmp_path):
     check("_clip 空值", p._clip("") == "（无输出）")
     check("_clip 短文本", p._clip("短") == "短")
     check("base64 解析", p._resolve_cred("base64:aGVsbG8=") == "hello")
-    check("env 解析", p._resolve_cred("env:SystemRoot") != "")
+    os.environ["_RT_TEST_CRED"] = "rt_secret_val"
+    try:
+        check("env 解析", p._resolve_cred("env:_RT_TEST_CRED") == "rt_secret_val")
+    finally:
+        os.environ.pop("_RT_TEST_CRED", None)
     check("未知前缀原样", p._resolve_cred("plain") == "plain")
 
 
