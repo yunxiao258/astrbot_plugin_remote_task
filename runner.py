@@ -198,7 +198,6 @@ class RunProcess:
             if rc != 0 and not self.error:
                 self.error = f"退出码 {rc}"
             return "done" if rc == 0 else "failed"
-        stderr_lines: list[str] = []
         while True:
             if self.cancelled:
                 break

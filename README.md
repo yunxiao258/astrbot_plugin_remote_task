@@ -140,6 +140,9 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 
 ## 更新记录
 
+### v1.4.1
+- 防御性解析 `retry_max` / `retry_interval_seconds` 防止脏配置抛 `ValueError`，清理 `scheduler.py` 重复导入与 `client.py` 无用变量
+
 ### v1.4.0
 - 接入插件生态中枢标准联动协议：任务完成/失败自动上报中枢归档群记忆并支持邮件告警，面板可查看任务列表与模式
 

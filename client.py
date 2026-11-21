@@ -55,7 +55,6 @@ def parse_sse_payload(event: str, data: str) -> tuple[str, str, str, dict] | Non
         if isinstance(inner_data, dict):
             payload = inner_data
             pl_type = str(inner_data.get("type") or payload.get("type") or "")
-    etype = ev_name or pl_type
     full = ev_name + " " + pl_type
     # 真实事件里 sessionID 位于 properties 内（顶层一般没有）
     props = payload.get("properties")

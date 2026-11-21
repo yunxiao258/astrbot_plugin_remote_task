@@ -49,7 +49,7 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "云晓",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.4.0",
+    "1.4.1",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
@@ -1038,7 +1038,10 @@ class RemoteTaskPlugin(Star):
 
     async def _execute_with_retry(self, task: Task):
         """执行任务，失败时按配置自动重试（retry_max 次，间隔 retry_interval_seconds）"""
-        max_retries = max(0, int(self.cfg.get("retry_max", 0) or 0))
+        try:
+            max_retries = max(0, int(self.cfg.get("retry_max", 0)))
+        except (TypeError, ValueError):
+            max_retries = 0
         attempt = 0
         while True:
             if task.mode == "serve":
@@ -1052,7 +1055,10 @@ class RemoteTaskPlugin(Star):
             ):
                 break
             attempt += 1
-            delay = max(1, int(self.cfg.get("retry_interval_seconds", 60) or 60))
+            try:
+                delay = max(1, int(self.cfg.get("retry_interval_seconds", 60)))
+            except (TypeError, ValueError):
+                delay = 60
             # 清掉旧运行资源引用（run 进程已结束；serve 会话映射已清理）
             self._runners.pop(task.id, None)
             self.store.update(
@@ -1400,7 +1406,7 @@ class RemoteTaskPlugin(Star):
         running = sum(1 for t in tasks if t.status == "running")
         failed = sum(1 for t in tasks if t.status == "failed")
         return {
-            "version": "1.4.0",
+            "version": "1.4.1",
             "status": "online",
             "metrics": {"任务记录": len(tasks), "运行中": running, "失败数": failed, "serve在线": "是" if self._serve_listening else "否"},
             "actions": ["list_tasks", "get_mode"],
