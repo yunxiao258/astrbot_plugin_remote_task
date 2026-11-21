@@ -43,7 +43,7 @@ from .tracker import (
 
 @register(
     "astrbot_plugin_remote_task",
-    "yunxiao258",
+    "云晓",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
     "1.3.0",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
