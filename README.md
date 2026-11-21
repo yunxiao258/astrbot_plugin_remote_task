@@ -140,6 +140,9 @@ AstrBot 插件：远程任务助手，在群里下发任务给 opencode 执行�
 
 ## 更新记录
 
+### v1.4.0
+- 接入插件生态中枢标准联动协议：任务完成/失败自动上报中枢归档群记忆并支持邮件告警，面板可查看任务列表与模式
+
 ### v1.3.0
 
 - 修复 `initialize()` 为同步函数导致 AstrBot v4.27.2 加载时 `TypeError: object NoneType can't be used in 'await' expression` 失败的问题，补充 `async def terminate()` 清理后台任务与 SSE 长连接

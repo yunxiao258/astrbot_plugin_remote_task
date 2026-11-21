@@ -26,6 +26,10 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 from .client import ServeClient, ServeManager
+try:
+    from .hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+except ImportError:
+    from hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
 from .cron import CronExpr
 from .runner import RunProcess, permission_rules_to_env
 from .scheduler import ScheduleEntry, ScheduleManager, ScheduleStore, validate_cron
@@ -45,10 +49,11 @@ from .tracker import (
     "astrbot_plugin_remote_task",
     "云晓",
     "opencode 远程任务助手：群里下发任务给 opencode 执行",
-    "1.3.0",
+    "1.4.0",
     repo="https://github.com/yunxiao258/astrbot_plugin_remote_task",
 )
 class RemoteTaskPlugin(Star):
+    HUB_PROTOCOL_VERSION = HUB_PROTOCOL_VERSION
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg = config
@@ -1008,6 +1013,11 @@ class RemoteTaskPlugin(Star):
     async def _execute(self, task: Task):
         try:
             await self._execute_with_retry(task)
+            latest = self.store.get(task.id)
+            if latest:
+                ev = "remote_task.completed" if latest.status == "done" else ("remote_task.failed" if latest.status == "failed" else "")
+                if ev:
+                    emit_hub_event("astrbot_plugin_remote_task", ev, {"task_id": task.id, "status": latest.status, "umo": task.creator_umo, "summary": f"任务 #{task.id} ({latest.status}): {task.desc[:120]}"}, self.context)
         except asyncio.CancelledError:
             # 被管理员取消：尽力终止遗留 run 进程后退出
             runner = self._runners.pop(task.id, None)
@@ -1022,6 +1032,7 @@ class RemoteTaskPlugin(Star):
             self.store.update(task.id, status="failed", error=str(e), finished_at=now_iso())
             await self._broadcast(f"任务 #{task.id} 执行异常: {e}", task.creator_umo, task.creator_self_id)
             await self._push_result_callback(task, f"📬 任务 #{task.id} 执行异常: {e}")
+            emit_hub_event("astrbot_plugin_remote_task", "remote_task.failed", {"task_id": task.id, "status": "failed", "umo": task.creator_umo, "summary": f"任务 #{task.id} 异常: {e}"}, self.context)
         finally:
             self._watch.pop(task.id, None)
 
@@ -1383,3 +1394,24 @@ class RemoteTaskPlugin(Star):
         raw = ctypes.string_at(out.pbData, out.cbData)
         ctypes.windll.kernel32.LocalFree(out.pbData)
         return raw.decode("utf-8")
+
+    def hub_status(self) -> dict:
+        tasks = self.store.list_recent(50)
+        running = sum(1 for t in tasks if t.status == "running")
+        failed = sum(1 for t in tasks if t.status == "failed")
+        return {
+            "version": "1.4.0",
+            "status": "online",
+            "metrics": {"任务记录": len(tasks), "运行中": running, "失败数": failed, "serve在线": "是" if self._serve_listening else "否"},
+            "actions": ["list_tasks", "get_mode"],
+        }
+
+    async def hub_action(self, action: str, params: dict | None = None) -> dict:
+        p = params or {}
+        if action == "list_tasks":
+            lim = max(1, min(50, int(p.get("limit", 10))))
+            tasks = self.store.list_recent(lim)
+            return {"ok": True, "data": [{"id": t.id, "status": t.status, "desc": t.desc[:100], "created_at": t.created_at} for t in tasks]}
+        if action == "get_mode":
+            return {"ok": True, "data": {"mode": self.cfg.get("mode", "auto"), "serve_listening": self._serve_listening}}
+        return {"ok": False, "error": f"不支持的动作：{action}"}
